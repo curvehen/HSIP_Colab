@@ -390,3 +390,44 @@ def fetch_intraday_hsi(fallback_df: pd.DataFrame = None):
     print("  ❌ 所有日內數據源均失敗，且無 fallback_df 可用")
     return None
 
+
+# ============================================================
+# [RECONSTRUCTED] HSI大盤版：盤中數據回填最後一行
+#     原始 Colab update_last_row_with_intraday() 定義缺失，
+#     依 fetch_intraday_hsi() 的回傳結構反推重建。
+#     僅更新 OHLC/close/ret_1d，不重算技術指標（RSI/MACD等）；
+#     技術指標重算由呼叫端在更新後重跑 build_features() 處理（方式A）。
+# ============================================================
+def update_last_row_with_intraday(last_row: pd.DataFrame, intraday: dict) -> pd.DataFrame:
+    """
+    用盤中數據更新 df_all 最後一行的 OHLC/close/ret_1d。
+    與 stock_model.py 的同名函式邏輯一致（通用合併規則）。
+
+    Args:
+        last_row : df_all.iloc[[-1]].copy()，單行 DataFrame
+        intraday : fetch_intraday_hsi() 的回傳 dict，可為 None
+
+    Returns:
+        更新後的單行 DataFrame（不重算技術指標，呼叫端需自行決定是否
+        重跑 build_features()）
+    """
+    row = last_row.copy().reset_index(drop=True)
+    if intraday is None:
+        return row
+
+    if intraday.get("open") is not None:
+        row.at[0, "open"] = intraday["open"]
+    if intraday.get("high") is not None:
+        row.at[0, "high"] = intraday["high"]
+    if intraday.get("low") is not None:
+        row.at[0, "low"] = intraday["low"]
+    if intraday.get("current") is not None:
+        row.at[0, "close"] = intraday["current"]
+
+    prev_close = intraday.get("prev_close")
+    current    = intraday.get("current")
+    if prev_close and current and prev_close > 0:
+        row.at[0, "ret_1d"] = (current - prev_close) / prev_close
+
+    return row
+
