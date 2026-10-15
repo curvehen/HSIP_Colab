@@ -21,6 +21,9 @@ from src.models import (
     align_features, safe_predict, safe_predict_batch,
     evaluate_short_confirmation, get_market_trend,
 )
+from src.hl_model import (
+    build_hl_targets, build_hl_features, get_hl_feat_cols, train_all_hl_models,
+)
 
 
 # ============================================================
@@ -126,9 +129,22 @@ def run_initial_training(df_all: pd.DataFrame) -> dict:
     joblib.dump(feat_cols_fixed, "models/feat_cols_fixed.pkl")
     print(f"  feat_cols_fixed.pkl saved: {len(feat_cols_fixed)} features")
 
+    # ── 訓練 HL (高低位) 模型 ──────────────────────────────────
+    print("\n  訓練 HL (高低位) 模型...")
+    try:
+        df_hl = build_hl_targets(df_all)
+        df_hl = build_hl_features(df_hl)
+        hl_feat_cols, hl_extra_cols = get_hl_feat_cols(df_hl, feat_cols)
+        df_train_hl = df_hl[train_mask].copy().reset_index(drop=True)
+        hl_models, hl_metrics = train_all_hl_models(df_train_hl, hl_feat_cols)
+    except Exception as e:
+        print(f"  ⚠️  HL模型訓練整體失敗，跳過: {e}")
+        hl_models, hl_feat_cols, hl_metrics = {}, [], {}
+
     print(f"\n  Initial Training Complete")
     print(f"  Init Model AUC : {init_metrics['auc']:.4f}")
     print(f"  Regime Models  : {list(regime_models.keys())}")
+    print(f"  HL Models      : {list(hl_models.keys())}")
     print("✅ training.py: run_initial_training() 完成")
 
     return {
@@ -142,7 +158,11 @@ def run_initial_training(df_all: pd.DataFrame) -> dict:
         "monitor"      : monitor,
         "memory"       : memory,
         "drift"        : drift,
+        "hl_models"    : hl_models,
+        "hl_feat_cols" : hl_feat_cols,
+        "hl_metrics"   : hl_metrics,
     }
+
 
 
 # ============================================================
@@ -208,12 +228,26 @@ def do_retrain_fixed(train_df, reasons, fold_idx, feat_cols, state: dict) -> str
             if rm is not None:
                 regime_models[regime] = rm
 
+    # ── HL (高低位) 模型同步重訓 ──────────────────────────────
+    hl_feat_cols = state.get("hl_feat_cols")
+    if hl_feat_cols:
+        try:
+            df_hl_use = build_hl_targets(use_df)
+            df_hl_use = build_hl_features(df_hl_use)
+            new_hl_models, new_hl_metrics = train_all_hl_models(df_hl_use, hl_feat_cols)
+            if new_hl_models:
+                state["hl_models"]  = new_hl_models
+                state["hl_metrics"] = new_hl_metrics
+        except Exception as e:
+            print(f"    ⚠️  HL模型重訓失敗，沿用舊模型: {e}")
+
     # ── 寫回 state ────────────────────────────────────────────
     state["global_model"]  = global_model
     state["regime_models"] = regime_models
     state["hmm"]            = hmm
 
     return action
+
 
 
 # ============================================================
@@ -512,17 +546,20 @@ def save_models(state: dict, out_dir: str = "models") -> None:
         joblib.dump(list(base_m.feature_name_),
                     os.path.join(out_dir, "feat_cols_fixed.pkl"))
 
+    # ── HL (高低位) 模型持久化，缺失不影響主流程 ──────────────
+    hl_models    = state.get("hl_models")
+    hl_feat_cols = state.get("hl_feat_cols")
+    if hl_models:
+        joblib.dump(hl_models,    os.path.join(out_dir, "hl_models.pkl"))
+        joblib.dump(hl_feat_cols, os.path.join(out_dir, "hl_feat_cols.pkl"))
+        print(f"     hl_models.pkl, hl_feat_cols.pkl")
+
     print(f"  ✅ 模型已儲存至 {out_dir}/")
     print(f"     global_model.pkl, regime_models.pkl, "
           f"hmm_model.pkl, feat_cols.pkl")
 
 
 def load_models(in_dir: str = "models") -> dict:
-    """
-    對應 Cell 7B 的反向操作（原版未顯式包含 load，
-    但 daily_pipeline.py 需要此函數才能在 GitHub Actions
-    的無狀態 runner 上避免每日重訓）。
-    """
     required = ["global_model.pkl", "regime_models.pkl",
                 "hmm_model.pkl", "feat_cols.pkl"]
     missing  = [f for f in required
@@ -537,8 +574,22 @@ def load_models(in_dir: str = "models") -> dict:
         "hmm"          : joblib.load(os.path.join(in_dir, "hmm_model.pkl")),
         "feat_cols"    : joblib.load(os.path.join(in_dir, "feat_cols.pkl")),
     }
+
+    # ── HL (高低位) 模型為附加功能，缺失不阻擋主流程 ──────────
+    hl_path          = os.path.join(in_dir, "hl_models.pkl")
+    hl_feat_cols_path = os.path.join(in_dir, "hl_feat_cols.pkl")
+    if os.path.exists(hl_path) and os.path.exists(hl_feat_cols_path):
+        state["hl_models"]    = joblib.load(hl_path)
+        state["hl_feat_cols"] = joblib.load(hl_feat_cols_path)
+        print(f"  ✅ HL模型已從 {in_dir}/ 載入")
+    else:
+        state["hl_models"]    = {}
+        state["hl_feat_cols"] = []
+        print(f"  ⚠️  HL模型檔案缺失，HL功能本次停用")
+
     print(f"  ✅ 模型已從 {in_dir}/ 載入")
     return state
+
 
 
 # ============================================================
