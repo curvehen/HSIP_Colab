@@ -1,89 +1,63 @@
 # ============================================================
 # src/config.py
-# Merged from: Cell 1 (deps note), Cell 2 (global config +
-# enhancement classes), Cell 2B (dynamic prediction context)
+# Merged from: Cell 1 (imports + 全域常數), Cell 2 (交易日曆),
+#              Cell 5 (ENH #1/#3/#5 自學組件: Threshold Calibrator,
+#              Position Sizer, Ensemble Weighter)
+#
+# SECURITY FIXES applied vs. original notebook:
+#   - FRED_API_KEY: removed hardcoded fallback value
+#     ("9affb17a4df8b012b124b6921df4b010"), now required via env var.
+#   - DASHSCOPE_API_KEY: removed hardcoded literal key, now required
+#     via env var.
+#   - Removed `from google.colab import userdata` (Colab-only import).
 # ============================================================
-import warnings
-warnings.filterwarnings("ignore")
-
-import pandas as pd
-import numpy as np
 import os
-import time
-import requests
-import pytz
 from datetime import datetime, timedelta
 from collections import deque
-from scipy import stats
+
+import numpy as np
+import pandas as pd
+import pytz
 from sklearn.metrics import f1_score
 
-os.makedirs("models",  exist_ok=True)
-os.makedirs("results", exist_ok=True)
-
-# ── ENH #9: pandas_market_calendars 假期日曆 ────────────────
 try:
     import pandas_market_calendars as mcal
+    _HAS_MCAL = True
+except ImportError:
+    _HAS_MCAL = False
+
+
+# ============================================================
+# Cell 1: 輸出目錄
+# ============================================================
+os.makedirs("models",  exist_ok=True)
+os.makedirs("results", exist_ok=True)
+os.makedirs("state",   exist_ok=True)
+
+
+# ============================================================
+# Cell 2: 交易日曆輔助函式（原樣保留，HK 時區手動計算，不依賴 pytz）
+# ============================================================
+def get_hkt_now():
+    """返回當前香港時間 (UTC+8)，不依賴 pytz"""
+    return datetime.utcnow() + timedelta(hours=8)
+
+
+if _HAS_MCAL:
     _XHKG = mcal.get_calendar("XHKG")
 
     def is_hk_trading_day(chk_date) -> bool:
         d = pd.Timestamp(chk_date).normalize()
         sched = _XHKG.schedule(
             start_date=d.strftime("%Y-%m-%d"),
-            end_date=d.strftime("%Y-%m-%d")
+            end_date=d.strftime("%Y-%m-%d"),
         )
         return len(sched) > 0
-
-    def get_next_hk_trading_day(from_date):
-        nxt = pd.Timestamp(from_date) + timedelta(days=1)
-        while not is_hk_trading_day(nxt):
-            nxt += timedelta(days=1)
-        return nxt.to_pydatetime()
-
-    def get_prev_hk_trading_day(from_date):
-        prv = pd.Timestamp(from_date) - timedelta(days=1)
-        while not is_hk_trading_day(prv):
-            prv -= timedelta(days=1)
-        return prv.to_pydatetime()
-
-    print("  ✅ ENH#9: pandas_market_calendars XHKG loaded")
-
-except ImportError:
-    print("  ⚠️  pandas_market_calendars 未安裝，使用 fallback 假期表")
-
-    HK_HOLIDAYS = {
-        "2025-01-01","2025-01-29","2025-01-30","2025-01-31",
-        "2025-04-04","2025-04-18","2025-04-19","2025-04-21",
-        "2025-05-01","2025-05-05","2025-06-02","2025-07-01",
-        "2025-09-29","2025-10-01","2025-10-06","2025-12-25","2025-12-26",
-        "2026-01-01","2026-02-17","2026-02-18","2026-02-19","2026-02-20",
-        "2026-04-03","2026-04-06","2026-05-01","2026-05-25",
-        "2026-06-19","2026-07-01","2026-10-01","2026-10-07",
-        "2026-12-25",
-    }
-
+else:
+    # Fallback: 若 pandas_market_calendars 未安裝，退化為「非週末即交易日」
     def is_hk_trading_day(chk_date) -> bool:
-        if chk_date.weekday() >= 5:
-            return False
-        if str(chk_date.date()) in HK_HOLIDAYS:
-            return False
-        return True
+        return pd.Timestamp(chk_date).weekday() < 5
 
-    def get_next_hk_trading_day(from_date):
-        nxt = from_date + timedelta(days=1)
-        while not is_hk_trading_day(nxt):
-            nxt += timedelta(days=1)
-        return nxt
-
-    def get_prev_hk_trading_day(from_date):
-        prv = from_date - timedelta(days=1)
-        while not is_hk_trading_day(prv):
-            prv -= timedelta(days=1)
-        return prv
-
-
-# ── Trading Calendar Helper Functions ──────────────────────────
-def get_hkt_now():
-    return datetime.utcnow() + timedelta(hours=8)
 
 def get_last_trading_day(reference_date=None):
     if reference_date is None:
@@ -98,6 +72,7 @@ def get_last_trading_day(reference_date=None):
         candidate -= timedelta(days=1)
     return candidate
 
+
 def get_next_trading_day(reference_date=None):
     if reference_date is None:
         reference_date = get_hkt_now()
@@ -106,6 +81,7 @@ def get_next_trading_day(reference_date=None):
     while not is_hk_trading_day(candidate):
         candidate += timedelta(days=1)
     return candidate
+
 
 def is_market_open_now():
     now_hkt = get_hkt_now()
@@ -116,102 +92,208 @@ def is_market_open_now():
     return market_open <= now_hkt <= market_close
 
 
-# ── 關鍵日期 ──────────────────────────────────────────────────
-NOW_HKT           = get_hkt_now()
-TODAY             = NOW_HKT
-TODAY_STR         = TODAY.strftime("%Y-%m-%d")
+# ============================================================
+# Cell 1: 日期 / 時間常數
+# ============================================================
+NOW_HKT          = get_hkt_now()
+TODAY            = NOW_HKT
+TODAY_STR        = TODAY.strftime("%Y-%m-%d")
+LAST_TRADING_DAY = get_last_trading_day(NOW_HKT)
+LAST_TRADING_STR = LAST_TRADING_DAY.strftime("%Y-%m-%d")
+NEXT_TRADING_DAY = get_next_trading_day(NOW_HKT)
+NEXT_TRADING_STR = NEXT_TRADING_DAY.strftime("%Y-%m-%d")
+MARKET_OPEN      = is_market_open_now()
+AFTER_CLOSE      = (NOW_HKT.weekday() < 5 and NOW_HKT.hour >= 17)
 
-LAST_TRADING_DAY  = get_last_trading_day(NOW_HKT)
-LAST_TRADING_STR  = LAST_TRADING_DAY.strftime("%Y-%m-%d")
-
-NEXT_TRADING_DAY  = get_next_trading_day(NOW_HKT)
-NEXT_TRADING_STR  = NEXT_TRADING_DAY.strftime("%Y-%m-%d")
-
-MARKET_OPEN       = is_market_open_now()
-AFTER_CLOSE       = (NOW_HKT.weekday() < 5 and NOW_HKT.hour >= 17)
-
-ROLLING_YEARS    = 5
-TRAIN_END_YEAR   = TODAY.year - 1
-TRAIN_END        = f"{TRAIN_END_YEAR}-12-31"
-TRAIN_START_YEAR = TODAY.year - ROLLING_YEARS
-TRAIN_START      = f"{TRAIN_START_YEAR}-01-01"
-
+ROLLING_YEARS     = 5
+TRAIN_END_YEAR    = TODAY.year - 1
+TRAIN_END         = f"{TRAIN_END_YEAR}-12-31"
+TRAIN_START_YEAR  = TODAY.year - ROLLING_YEARS
+TRAIN_START       = f"{TRAIN_START_YEAR}-01-01"
 SIM_START         = f"{TODAY.year}-01-01"
 SIM_END           = LAST_TRADING_STR
+DOWNLOAD_START    = f"{TODAY.year - ROLLING_YEARS - 1}-01-01"
+DOWNLOAD_END      = (datetime.strptime(TODAY_STR, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
 
-DOWNLOAD_START   = f"{TODAY.year - ROLLING_YEARS - 1}-01-01"
-DOWNLOAD_END      = (datetime.strptime(TODAY_STR, "%Y-%m-%d")
-                     + timedelta(days=1)).strftime("%Y-%m-%d")
+TRAIN_WINDOW        = 504
+PROB_LONG           = 0.60
+PROB_SHORT          = 0.42
+TRANSACTION_COST    = 0.002
+SLIPPAGE_POINTS     = 3
+PERF_WINDOW         = 42
+PERF_THRESHOLD      = 0.46
+RETRAIN_INTERVAL    = 42
+KS_PVALUE           = 0.05
+ROLLBACK_TOLERANCE  = 0.2
 
-print(f"  訓練窗口 : {TRAIN_START} → {TRAIN_END}  ({ROLLING_YEARS} 年)")
-print(f"  數據下載 : {DOWNLOAD_START} → 今日")
 
-# ── 模型配置 ──────────────────────────────────────────────────
-TRAIN_WINDOW         = 504
-PROB_LONG            = 0.60
-PROB_SHORT           = 0.42
-TRANSACTION_COST     = 0.002
-SLIPPAGE_POINTS      = 3
-
-PERF_WINDOW          = 42
-PERF_THRESHOLD       = 0.46
-RETRAIN_INTERVAL     = 42
-KS_PVALUE            = 0.05
-ROLLBACK_TOLERANCE   = 0.2
-
+# ============================================================
+# LightGBM 參數
+# ============================================================
 LGBM_PARAMS = {
-    "objective"        : "binary",
-    "metric"           : "auc",
-    "learning_rate"    : 0.02,
-    "num_leaves"       : 48,
+    "objective": "binary",
+    "metric": "auc",
+    "learning_rate": 0.02,
+    "num_leaves": 48,
     "min_child_samples": 30,
-    "feature_fraction" : 0.7,
-    "bagging_fraction" : 0.8,
-    "bagging_freq"     : 5,
-    "lambda_l1"        : 0.3,
-    "lambda_l2"        : 0.8,
-    "verbose"          : -1,
-    "n_estimators"     : 600,
-    "random_state"     : 42,
+    "feature_fraction": 0.7,
+    "bagging_fraction": 0.8,
+    "bagging_freq": 5,
+    "lambda_l1": 0.3,
+    "lambda_l2": 0.8,
+    "verbose": -1,
+    "n_estimators": 600,
+    "random_state": 42,
 }
 
-# ── ENH #11: Credentials 用環境變量 ─────────────────────────────
-from dotenv import load_dotenv
-load_dotenv(override=False)
+LGBM_REG_PARAMS = {
+    "objective": "regression",
+    "metric": "mae",
+    "learning_rate": 0.02,
+    "num_leaves": 48,
+    "min_child_samples": 30,
+    "feature_fraction": 0.7,
+    "bagging_fraction": 0.8,
+    "bagging_freq": 5,
+    "lambda_l1": 0.3,
+    "lambda_l2": 0.8,
+    "verbose": -1,
+    "n_estimators": 600,
+    "random_state": 42,
+}
 
-EMAIL_SENDER   = os.environ.get("EMAIL_SENDER",   "")
-EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "")
-EMAIL_RECEIVER = os.environ.get("EMAIL_RECEIVER", "")
 
-if not EMAIL_SENDER:
-    # [FIX] 原版在此處印出真實 Gmail 地址/應用密碼/收件人作為「示例」，
-    # 已改為通用佔位提示，不洩露任何真實憑證
-    print("  ⚠️  ENH#11: EMAIL_SENDER 未設定，請在 .env / GitHub Secrets 加入:")
-    print("       EMAIL_SENDER=<your_email@gmail.com>")
-    print("       EMAIL_PASSWORD=<your_app_password>")
-    print("       EMAIL_RECEIVER=<comma,separated,recipients>")
+# ============================================================
+# SECURITY FIX: API Keys — 嚴格從環境變數讀取，無硬編碼 fallback
+# ============================================================
+FRED_API_KEY = os.environ.get("FRED_API_KEY", "")
+if not FRED_API_KEY:
+    print("  ⚠️  FRED_API_KEY 未設定 — FRED 總經數據將被跳過")
 
-# [FIX] 原版: FRED_API_KEY = os.environ.get("FRED_API_KEY", "9affb...literal key...")
-# 已移除硬編碼 fallback，改為純環境變量讀取（無效則為 None）
-FRED_API_KEY = os.environ.get("FRED_API_KEY")
+DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
+if not DASHSCOPE_API_KEY:
+    print("  ⚠️  DASHSCOPE_API_KEY 未設定 — AI 評論功能將被跳過")
 
-# [FIX] DASHSCOPE_API_KEY 原本在 Intraday Monitoring 段落硬編碼明文，
-# 該段落本身不納入排程版本（常駐 polling loop，與 GitHub Actions cron 不相容）。
-# 若日後需要，改用:
-# DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY")
+AI_MODEL = "qwen-plus"
 
+
+# ============================================================
+# 特徵黑名單
+# ============================================================
 FEATURE_BLACKLIST = {
-    "date","next_ret","target",
-    "open","high","low","close","volume"
+    "date", "next_ret", "target",
+    "open", "high", "low", "close", "volume",
 }
 
-stock_models = {}
+
+# ============================================================
+# 時區 / 盤中時間常數
+# ============================================================
+HKT    = pytz.timezone("Asia/Hong_Kong")
+HK_TZ  = pytz.timezone("Asia/Hong_Kong")
+
+MARKET_OPEN_H    = 9
+MARKET_OPEN_M    = 30
+MARKET_CLOSE_H   = 16
+MARKET_CLOSE_M   = 0
+INTRADAY_START_H = 9
+INTRADAY_START_M = 30
+
+
+# ============================================================
+# 資產 / 經濟數據代碼對照表
+# ============================================================
+yf_map = {
+    "sp500":   "^GSPC",
+    "nasdaq":  "^IXIC",
+    "vix":     "^VIX",
+    "us10y":   "^TNX",
+    "us2y":    "^IRX",
+    "dxy":     "DX-Y.NYB",
+    "csi300":  "000300.SS",
+    "sse":     "000001.SS",
+    "gold":    "GC=F",
+    "oil":     "CL=F",
+    "copper":  "HG=F",
+    "usdcny":  "CNY=X",
+    "tencent": "0700.HK",
+    "hsbc":    "0005.HK",
+    "alibaba": "9988.HK",
+    "meituan": "3690.HK",
+}
+
+fred_map = {
+    "fed_rate":    "FEDFUNDS",
+    "us_cpi":      "CPIAUCSL",
+    "us_core_cpi": "CPILFESL",
+    "nonfarm":     "PAYEMS",
+    "yield_curve": "T10Y2Y",
+    "jobless":     "ICSA",
+}
+
+
+# ============================================================
+# 個股清單
+# ============================================================
+MODEL_DIR = "models"
+
+STOCK_LIST = {
+    "0700.HK": "騰訊",     "9988.HK": "阿里巴巴", "3690.HK": "美團",
+    "9618.HK": "京東",     "0992.HK": "聯想",     "0005.HK": "匯豐",
+    "0939.HK": "建設銀行", "1398.HK": "工商銀行", "0388.HK": "港交所",
+    "2318.HK": "中國平安", "3988.HK": "中國銀行", "0016.HK": "新鴻基地產",
+    "0001.HK": "長和",     "1109.HK": "華潤置地", "9999.HK": "網易",
+    "0291.HK": "華潤啤酒", "0762.HK": "中國聯通", "0857.HK": "中國石油",
+    "0386.HK": "中國石化", "1088.HK": "中國神華", "1177.HK": "中國生物製藥",
+    "2269.HK": "藥明生物", "1211.HK": "比亞迪股份", "0968.HK": "信義光能",
+}
+
+SECTOR_MAP = {
+    "0700.HK": "科技", "9988.HK": "科技", "3690.HK": "科技", "9618.HK": "科技",
+    "0992.HK": "科技", "9999.HK": "科技",
+    "0005.HK": "金融", "0939.HK": "金融", "1398.HK": "金融", "0388.HK": "金融",
+    "2318.HK": "金融", "3988.HK": "金融",
+    "0016.HK": "地產", "0001.HK": "地產", "1109.HK": "地產",
+    "0291.HK": "消費",
+    "0762.HK": "電訊",
+    "0857.HK": "能源", "0386.HK": "能源", "1088.HK": "能源",
+    "1177.HK": "醫療", "2269.HK": "醫療",
+    "1211.HK": "車",
+    "0968.HK": "光伏",
+}
+
+STOCK_TRAIN_START  = "2020-01-01"
+STOCK_SIM_START    = SIM_START
+STOCK_MIN_HISTORY  = 252
+STOCK_TOP_N        = 5
+
+
+# ============================================================
+# 高/低點與 AI 評論相關常數
+# ============================================================
+SUDDEN_CHANGE_THRESHOLD = 0.3
+SUDDEN_RANGE_THRESHOLD  = 0.4
+SCHEDULED_AI_TIMES      = ["11:30", "12:30", "13:30"]
+
+
+# ============================================================
+# 隨機種子 / HMM 參數
+# ============================================================
+SEEDS        = [42, 0, 123]
+RANDOM_STATE = 42
+HMM_N_ITER   = 300
+HMM_TOL      = 1e-5
 
 
 # ============================================================
 # ENH #1: Regime-Based Dynamic Threshold Calibrator
 # ============================================================
 class RegimeThresholdCalibrator:
+    """
+    為每個 HMM regime 獨立 calibrate PROB_LONG / PROB_SHORT。
+    用 validation set F1 score 做優化目標。
+    """
+
     def __init__(self, regimes=("bull", "neutral", "bear")):
         self.regimes = regimes
         self.thresholds = {
@@ -223,7 +305,7 @@ class RegimeThresholdCalibrator:
     def _score_threshold(self, probs, actuals, long_thresh, short_thresh):
         signals = np.where(
             probs >= long_thresh, 1,
-            np.where(probs <= short_thresh, -1, 0)
+            np.where(probs <= short_thresh, -1, 0),
         )
         mask = signals != 0
         if mask.sum() < 10:
@@ -263,347 +345,170 @@ class RegimeThresholdCalibrator:
                         best_long  = lt
                         best_short = st
 
+            
+
             self.thresholds[regime] = {
-                "long" : round(best_long,  2),
+                "long":  round(best_long,  2),
                 "short": round(best_short, 2),
-                "f1"   : round(best_score, 4),
-                "n"    : len(rdf),
+                "f1":    round(best_score, 4),
+                "n":     len(rdf),
             }
             print(f"  [Calibrator] {regime:8s}: "
                   f"long={best_long:.2f} short={best_short:.2f} "
-                  f"F1={best_score:.4f} n={len(rdf)}")
+                  f"F1={best_score:.4f} (n={len(rdf)})")
 
         self.fitted = True
         return self
 
+    def get_thresholds(self, regime: str):
+        if regime not in self.thresholds:
+            return PROB_LONG, PROB_SHORT
+        t = self.thresholds[regime]
+        return t["long"], t["short"]
+
     def get_signal(self, prob: float, regime: str) -> int:
-        t = self.thresholds.get(regime, self.thresholds.get("neutral"))
-        if prob >= t["long"]:
+        long_t, short_t = self.get_thresholds(regime)
+        if prob >= long_t:
             return 1
-        elif prob <= t["short"]:
+        elif prob <= short_t:
             return -1
         return 0
 
-    def summary(self):
-        print("\n  === Regime Threshold Summary ===")
-        for r, t in self.thresholds.items():
-            print(f"  {r:8s}: long={t['long']:.2f}  "
-                  f"short={t['short']:.2f}  F1={t['f1']:.4f}")
-
 
 # ============================================================
-# ENH #3: Position Sizer (Fractional Kelly)
+# ENH #3: Kelly-based Dynamic Position Sizer
 # ============================================================
 class PositionSizer:
-    def __init__(self, method: str = "fractional_kelly",
-                 max_position: float = 1.0,
-                 kelly_fraction: float = 0.25,
-                 min_edge: float = 0.02):
-        self.method         = method
-        self.max_position   = max_position
-        self.kelly_fraction = kelly_fraction
-        self.min_edge       = min_edge
+    """
+    依據 Kelly Criterion 估計部位大小，並以信心度/regime/
+    滾動命中率做調整，限制在 [MIN_POSITION, MAX_POSITION] 之間。
+    """
 
-    def compute_size(self, prob: float, signal: int,
-                     regime: str = "neutral", roll_acc: float = 0.5) -> float:
+    def __init__(self, max_position: float = 1.0, min_position: float = 0.2,
+                 kelly_fraction: float = 0.5):
+        self.max_position   = max_position
+        self.min_position   = min_position
+        self.kelly_fraction = kelly_fraction
+        self.regime_risk = {"bull": 1.0, "neutral": 0.8, "bear": 0.6}
+
+    def _kelly(self, prob: float) -> float:
+        p = max(min(prob, 0.999), 0.001)
+        q = 1 - p
+        b = 1.0
+        kelly = (b * p - q) / b
+        return max(kelly, 0.0)
+
+    def compute_size(self, prob: float, signal: int, regime: str,
+                      roll_acc: float = 0.5) -> float:
         if signal == 0:
             return 0.0
 
-        win_prob = prob if signal == 1 else (1.0 - prob)
-        edge     = win_prob - 0.5
+        edge_prob = prob if signal == 1 else (1 - prob)
+        kelly_raw = self._kelly(edge_prob)
+        kelly_adj = kelly_raw * self.kelly_fraction
 
-        if edge < self.min_edge:
-            return 0.0
+        regime_mult = self.regime_risk.get(regime, 0.8)
 
-        if self.method == "fractional_kelly":
-            size = edge * self.kelly_fraction
-        elif self.method == "prob_linear":
-            size = (edge * 2) * self.max_position
-        else:
-            size = self.max_position
+        conf_mult = 1.0
+        if roll_acc < 0.45:
+            conf_mult = 0.5
+        elif roll_acc < 0.50:
+            conf_mult = 0.75
+        elif roll_acc > 0.58:
+            conf_mult = 1.15
 
-        regime_mult = {"bull": 1.10, "neutral": 1.00, "bear": 0.70}.get(regime, 1.0)
-        acc_mult    = max(0.3, min(1.5, roll_acc / 0.5))
-
-        size = size * regime_mult * acc_mult
-        return float(np.clip(size, 0.0, self.max_position))
+        size = kelly_adj * regime_mult * conf_mult
+        size = max(min(size, self.max_position), self.min_position)
+        return round(size, 4)
 
 
 # ============================================================
 # ENH #5: Dynamic Ensemble Weighter
 # ============================================================
 class DynamicEnsembleWeighter:
-    def __init__(self, window: int = 20, min_weight: float = 0.1):
+    """
+    追蹤 global model 與 regime model 近期表現，
+    動態調整兩者在 ensemble 中的權重（滑動視窗命中率反比）。
+    """
+
+    def __init__(self, window: int = 60, min_weight: float = 0.2):
         self.window     = window
         self.min_weight = min_weight
-        self.histories  = {
+        self.history = {
             "global": deque(maxlen=window),
             "regime": deque(maxlen=window),
         }
+        self.weights = {"global": 0.5, "regime": 0.5}
 
-    def update(self, model_name: str, prob: float, actual: int):
-        if model_name in self.histories:
-            self.histories[model_name].append((float(prob), int(actual)))
+    def update(self, model_key: str, prob: float, actual_target: int):
+        if model_key not in self.history:
+            return
+        pred_correct = int((prob >= 0.5) == bool(actual_target))
+        self.history[model_key].append(pred_correct)
+        self._recompute_weights()
 
-    def _rolling_brier(self, history) -> float:
-        if len(history) < 5:
-            return 0.25
-        probs   = np.array([h[0] for h in history])
-        actuals = np.array([h[1] for h in history])
-        return float(np.mean((probs - actuals) ** 2))
+    def _recompute_weights(self):
+        g_hist = self.history["global"]
+        r_hist = self.history["regime"]
 
-    def get_weights(self) -> dict:
-        scores = {}
-        for name, hist in self.histories.items():
-            bs    = self._rolling_brier(hist)
-            skill = max(0.0, 1.0 - bs / 0.25)
-            scores[name] = skill
+        if len(g_hist) < 10 or len(r_hist) < 10:
+            self.weights = {"global": 0.5, "regime": 0.5}
+            return
 
-        total = sum(scores.values())
-        if total < 1e-9:
-            return {k: 1.0 / len(scores) for k in scores}
+        g_acc = sum(g_hist) / len(g_hist)
+        r_acc = sum(r_hist) / len(r_hist)
+        total = g_acc + r_acc
 
-        weights = {k: max(v / total, self.min_weight) for k, v in scores.items()}
-        total_w = sum(weights.values())
-        return {k: v / total_w for k, v in weights.items()}
+        if total <= 0:
+            self.weights = {"global": 0.5, "regime": 0.5}
+            return
+
+        g_w = g_acc / total
+        r_w = r_acc / total
+
+        g_w = max(min(g_w, 1 - self.min_weight), self.min_weight)
+        r_w = 1 - g_w
+
+        self.weights = {"global": round(g_w, 4), "regime": round(r_w, 4)}
 
     def ensemble(self, g_prob: float, r_prob: float) -> float:
-        w = self.get_weights()
-        result = w.get("global", 0.5) * g_prob + w.get("regime", 0.5) * r_prob
-        return float(np.clip(result, 0.0, 1.0))
+        w = self.weights
+        return w["global"] * g_prob + w["regime"] * r_prob
 
-    def weight_summary(self) -> str:
-        w = self.get_weights()
-        return f"global={w.get('global',0):.2f} regime={w.get('regime',0):.2f}"
+    def weight_summary(self) -> dict:
+        return dict(self.weights)
 
 
+# ============================================================
+# Singleton 實例 — 由 training.py / daily_pipeline.py 共用，
+# 並透過 state['threshold_calibrator'] 等 key 持久化/還原
+# ============================================================
 threshold_calibrator = RegimeThresholdCalibrator()
 position_sizer       = PositionSizer(
-    method="fractional_kelly", max_position=1.0,
-    kelly_fraction=0.25, min_edge=0.02,
+    max_position=1.0, min_position=0.2, kelly_fraction=0.5,
 )
-ensemble_weighter = DynamicEnsembleWeighter(window=20)
-
-print("✅ config.py 完成: 所有配置 + Enhancement 物件初始化完畢")
-print(f"   TODAY={TODAY_STR}  TRAIN={TRAIN_START}~{TRAIN_END}")
-print(f"   SIM  ={SIM_START}~{SIM_END}")
+ensemble_weighter    = DynamicEnsembleWeighter(window=60, min_weight=0.2)
 
 
 # ============================================================
-# Cell 2B: 動態預測目標邏輯
+# 持久化相關路徑與 state keys
 # ============================================================
-HKT = pytz.timezone("Asia/Hong_Kong")
+MODELS_DIR = "models"
+RESULTS_DIR = "results"
+STATE_DIR  = "state"
+STATE_PATH = os.path.join(STATE_DIR, "pipeline_state.pkl")
 
-MARKET_OPEN_H    = 9
-MARKET_OPEN_M    = 30
-MARKET_CLOSE_H   = 16
-MARKET_CLOSE_M   = 0
-INTRADAY_START_H = 9
-INTRADAY_START_M = 30
+STATE_KEYS = [
+    "df_all", "feat_cols",
+    "global_model", "regime_models", "hmm",
+    "monitor", "memory", "drift",
+    "threshold_calibrator", "position_sizer", "ensemble_weighter",
+    "wf_monthly", "last_backtest_report",
+]
 
+CHART_STATE_KEYS = [
+    "last_backtest_report",
+]
 
-def get_hkt_now_tz():
-    return datetime.now(HKT)
+CALIBRATION_MIN_SAMPLES = 30
 
-
-def is_weekday(dt):
-    return dt.weekday() < 5
-
-
-def is_market_hours(dt):
-    if not is_weekday(dt):
-        return False
-    t = dt.time()
-    open_t  = dt.replace(hour=MARKET_OPEN_H, minute=MARKET_OPEN_M,
-                         second=0, microsecond=0).time()
-    close_t = dt.replace(hour=MARKET_CLOSE_H, minute=MARKET_CLOSE_M,
-                         second=0, microsecond=0).time()
-    return open_t <= t < close_t
-
-
-def is_after_close(dt):
-    if not is_weekday(dt):
-        return True
-    t      = dt.time()
-    close_t = dt.replace(hour=MARKET_CLOSE_H, minute=MARKET_CLOSE_M,
-                         second=0, microsecond=0).time()
-    return t >= close_t
-
-
-def is_before_open(dt):
-    if not is_weekday(dt):
-        return False
-    t      = dt.time()
-    open_t = dt.replace(hour=MARKET_OPEN_H, minute=MARKET_OPEN_M,
-                        second=0, microsecond=0).time()
-    return t < open_t
-
-
-def get_next_trading_day_from(dt):
-    candidate = dt + timedelta(days=1)
-    while candidate.weekday() >= 5:
-        candidate += timedelta(days=1)
-    return candidate
-
-
-def get_last_trading_day_from(dt):
-    candidate = dt - timedelta(days=1)
-    while candidate.weekday() >= 5:
-        candidate -= timedelta(days=1)
-    return candidate
-
-
-def get_prediction_context():
-    now = get_hkt_now_tz()
-    today = now.date()
-
-    result = {
-        "now_hkt"         : now,
-        "today_str"       : today.strftime("%Y-%m-%d"),
-        "now_time_str"    : now.strftime("%H:%M:%S"),
-        "now_hkt_str"     : now.strftime("%Y-%m-%d %H:%M:%S"),
-    }
-
-    if not is_weekday(now):
-        last_trading = get_last_trading_day_from(
-            datetime.combine(today, datetime.min.time()))
-        next_trading = get_next_trading_day_from(
-            datetime.combine(today, datetime.min.time()))
-        result.update({
-            "scenario"       : 4,
-            "scenario_desc"  : "週末 → 預測下一交易日",
-            "predict_date_str": next_trading.strftime("%Y-%m-%d"),
-            "base_date_str"  : last_trading.strftime("%Y-%m-%d"),
-            "use_intraday"   : False,
-            "intraday_avail" : "無（週末）",
-            "data_note"      : (
-                f"使用 {last_trading.strftime('%Y-%m-%d')} "
-                f"收市數據預測 {next_trading.strftime('%Y-%m-%d')}"
-            ),
-        })
-
-    elif is_after_close(now):
-        next_trading = get_next_trading_day_from(
-            datetime.combine(today, datetime.min.time()))
-        result.update({
-            "scenario"        : 1,
-            "scenario_desc"   : "平日收市後 → 預測明日",
-            "predict_date_str": next_trading.strftime("%Y-%m-%d"),
-            "base_date_str"   : today.strftime("%Y-%m-%d"),
-            "use_intraday"    : False,
-            "intraday_avail"  : "今日收市數據已可用",
-            "data_note"       : (
-                f"使用今日（{today}）完整收市數據，"
-                f"預測 {next_trading.strftime('%Y-%m-%d')}
-                ),
-          })
-
-    elif is_before_open(now):
-        last_trading = get_last_trading_day_from(
-            datetime.combine(today, datetime.min.time()))
-        result.update({
-            "scenario"        : 2,
-            "scenario_desc"   : "開市前 → 預測今日（昨收數據）",
-            "predict_date_str": today.strftime("%Y-%m-%d"),
-            "base_date_str"   : last_trading.strftime("%Y-%m-%d"),
-            "use_intraday"    : False,
-            "intraday_avail"  : "未開市，無日內數據",
-            "data_note"       : (
-                f"使用昨日（{last_trading.strftime('%Y-%m-%d')}）"
-                f"收市數據，預測今日 {today}"
-            ),
-        })
-
-    elif is_market_hours(now):
-        t = now.time()
-
-        if t.hour < 10:
-            intraday_qual = "早盤（數據有限）"
-            intraday_pct  = 0.1
-        elif t.hour < 12:
-            intraday_qual = "上午盤（數據中等）"
-            intraday_pct  = 0.4
-        elif t.hour < 14:
-            intraday_qual = "午後（數據較好）"
-            intraday_pct  = 0.6
-        else:
-            intraday_qual = "尾市（數據充足）"
-            intraday_pct  = 0.85
-
-        last_trading = get_last_trading_day_from(
-            datetime.combine(today, datetime.min.time()))
-
-        result.update({
-            "scenario"        : 3,
-            "scenario_desc"   : f"開市中 → 預測今日（{intraday_qual}）",
-            "predict_date_str": today.strftime("%Y-%m-%d"),
-            "base_date_str"   : last_trading.strftime("%Y-%m-%d"),
-            "use_intraday"    : True,
-            "intraday_avail"  : intraday_qual,
-            "intraday_pct"    : intraday_pct,
-            "data_note"       : (
-                f"使用昨收 + 今日實時數據（{intraday_qual}），"
-                f"預測今日 {today} 收市方向"
-            ),
-        })
-
-    else:
-        last_trading = get_last_trading_day_from(
-            datetime.combine(today, datetime.min.time()))
-        next_trading = get_next_trading_day_from(
-            datetime.combine(today, datetime.min.time()))
-        result.update({
-            "scenario"        : 1,
-            "scenario_desc"   : "其他情況 → 預測明日",
-            "predict_date_str": next_trading.strftime("%Y-%m-%d"),
-            "base_date_str"   : last_trading.strftime("%Y-%m-%d"),
-            "use_intraday"    : False,
-            "intraday_avail"  : "未知",
-            "data_note"       : "使用最後已知收市數據",
-        })
-
-    return result
-
-
-# ── 立即執行，取得當前情境 ───────────────────────────────────
-CTX = get_prediction_context()
-
-print("=" * 60)
-print("  🕐 動態預測情境判斷")
-print("=" * 60)
-print(f"  當前香港時間 : {CTX['now_hkt_str']}")
-print(f"  今日日期     : {CTX['today_str']}")
-print()
-print(f"  情境         : {CTX['scenario']} — {CTX['scenario_desc']}")
-print(f"  基準日期     : {CTX['base_date_str']}（最後已知數據）")
-print(f"  預測目標     : {CTX['predict_date_str']}")
-print(f"  日內數據     : {CTX['intraday_avail']}")
-print(f"  數據說明     : {CTX['data_note']}")
-print()
-
-scenario_icons = {
-    1: "🌙 收市後",
-    2: "🌅 開市前",
-    3: "📈 開市中",
-    4: "📅 週末",
-}
-print(f"  {scenario_icons.get(CTX['scenario'], '❓')} "
-      f"情境 {CTX['scenario']}：{CTX['scenario_desc']}")
-print("=" * 60)
-print("✅ config.py (Cell 1+2+2B) 載入完成")
-
-
-
-# ── Adaptive component constants [RECONSTRUCTED] ───────────
-PROB_LONG                = 0.58
-PROB_SHORT               = 0.42
-KELLY_FRACTION           = 0.5     # half-Kelly
-MAX_POSITION             = 1.0
-MIN_POSITION             = 0.0
-CALIBRATION_MIN_SAMPLES  = 30
-
-from src.adaptive import ThresholdCalibrator, PositionSizer, EnsembleWeighter
-
-threshold_calibrator = ThresholdCalibrator()
-position_sizer        = PositionSizer()
-ensemble_weighter     = EnsembleWeighter()
