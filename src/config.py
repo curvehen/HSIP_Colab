@@ -1,6 +1,7 @@
 # ============================================================
 # src/config.py
 # Merged from: Cell 1 (imports + 全域常數), Cell 2 (交易日曆),
+#              Cell 2B (動態預測情境判斷 CTX),
 #              Cell 5 (ENH #1/#3/#5 自學組件: Threshold Calibrator,
 #              Position Sizer, Ensemble Weighter)
 #
@@ -10,6 +11,27 @@
 #   - DASHSCOPE_API_KEY: removed hardcoded literal key, now required
 #     via env var.
 #   - Removed `from google.colab import userdata` (Colab-only import).
+#
+# STRUCTURAL FIXES applied vs. original notebook (see conversation log):
+#   - [Fix 1] Unified get_hkt_now() to timezone-aware (pytz), replacing
+#     the original naive `datetime.utcnow()+8h` version. Original code
+#     had two incompatible datetime flavors (naive in Cell 2, aware in
+#     Cell 2B) that only avoided clashing due to notebook execution
+#     order; splitting into modules would raise
+#     `TypeError: can't subtract offset-naive and offset-aware datetimes`.
+#   - [Fix 3] Added refresh_ctx() helper. CTX below is a load-time
+#     snapshot; downstream modules needing a fresh scenario judgement
+#     (email_report.py, final report stage of daily_pipeline.py) must
+#     call refresh_ctx() instead of reading stale config.CTX, mirroring
+#     the original notebook's repeated calls to get_prediction_context()
+#     in Cells 21b/22/24/28/29B/30.
+#   - [Fix 5] Removed duplicate constants: MODEL_DIR (duplicate of
+#     MODELS_DIR) and HK_TZ (duplicate of HKT).
+#   - [Note on Fix 6] is_weekday() (Cell 2B) does NOT recognize HK
+#     public holidays, unlike is_hk_trading_day() (Cell 2, uses
+#     pandas_market_calendars). This is an original-notebook limitation,
+#     preserved as-is. daily_pipeline.py should guard its entrypoint
+#     with is_hk_trading_day() before running on holidays.
 # ============================================================
 import os
 from datetime import datetime, timedelta
@@ -36,11 +58,22 @@ os.makedirs("state",   exist_ok=True)
 
 
 # ============================================================
-# Cell 2: 交易日曆輔助函式（原樣保留，HK 時區手動計算，不依賴 pytz）
+# 時區常數（統一定義一次，供全檔案使用）
+# [Fix 5] 原本 HKT 與 HK_TZ 重複定義為同一個 pytz 物件，只保留 HKT。
+# ============================================================
+HKT = pytz.timezone("Asia/Hong_Kong")
+
+
+# ============================================================
+# Cell 2: 交易日曆輔助函式
+# [Fix 1] get_hkt_now() 原本用 naive datetime
+#         (`datetime.utcnow() + timedelta(hours=8)`)，現統一改為
+#         timezone-aware，與 Cell 2B 的 get_prediction_context()
+#         保持一致，避免 naive/aware datetime 混算拋出 TypeError。
 # ============================================================
 def get_hkt_now():
-    """返回當前香港時間 (UTC+8)，不依賴 pytz"""
-    return datetime.utcnow() + timedelta(hours=8)
+    """返回當前香港時間（timezone-aware，Asia/Hong_Kong）"""
+    return datetime.now(HKT)
 
 
 if _HAS_MCAL:
@@ -187,11 +220,8 @@ FEATURE_BLACKLIST = {
 
 
 # ============================================================
-# 時區 / 盤中時間常數
+# 盤中時間常數
 # ============================================================
-HKT    = pytz.timezone("Asia/Hong_Kong")
-HK_TZ  = pytz.timezone("Asia/Hong_Kong")
-
 MARKET_OPEN_H    = 9
 MARKET_OPEN_M    = 30
 MARKET_CLOSE_H   = 16
@@ -234,9 +264,9 @@ fred_map = {
 
 # ============================================================
 # 個股清單
+# [Fix 5] 移除重複的 MODEL_DIR（與下方 MODELS_DIR 同值），
+#         個股模組請統一引用 MODELS_DIR。
 # ============================================================
-MODEL_DIR = "models"
-
 STOCK_LIST = {
     "0700.HK": "騰訊",     "9988.HK": "阿里巴巴", "3690.HK": "美團",
     "9618.HK": "京東",     "0992.HK": "聯想",     "0005.HK": "匯豐",
@@ -283,6 +313,155 @@ SEEDS        = [42, 0, 123]
 RANDOM_STATE = 42
 HMM_N_ITER   = 300
 HMM_TOL      = 1e-5
+
+
+# ============================================================
+# Cell 2B: 動態預測情境判斷（CTX）
+# 原始 notebook 用獨立嘅 is_weekday/is_market_hours 等輔助函式，
+# 與 Cell 2 的 is_hk_trading_day（基於 pandas_market_calendars）
+# 是兩套獨立邏輯，此處原樣保留以免改變原始行為。
+#
+# [Note on Fix 6] is_weekday() 不識別香港公眾假期，只判斷星期幾。
+# 假期當日 CTX["scenario"] 可能誤判為平日情境。這是原始 notebook
+# 本身的限制，此處不修改判斷邏輯本身；daily_pipeline.py 的入口應
+# 另外用 is_hk_trading_day() 做假期 guard（見該檔案）。
+# ============================================================
+def is_weekday(dt) -> bool:
+    return dt.weekday() < 5
+
+
+def is_market_hours(dt) -> bool:
+    if not is_weekday(dt):
+        return False
+    t = dt.time()
+    open_t  = dt.replace(hour=MARKET_OPEN_H,  minute=MARKET_OPEN_M,  second=0, microsecond=0).time()
+    close_t = dt.replace(hour=MARKET_CLOSE_H, minute=MARKET_CLOSE_M, second=0, microsecond=0).time()
+    return open_t <= t < close_t
+
+
+def is_after_close(dt) -> bool:
+    if not is_weekday(dt):
+        return True
+    t = dt.time()
+    close_t = dt.replace(hour=MARKET_CLOSE_H, minute=MARKET_CLOSE_M, second=0, microsecond=0).time()
+    return t >= close_t
+
+
+def is_before_open(dt) -> bool:
+    if not is_weekday(dt):
+        return False
+    t = dt.time()
+    open_t = dt.replace(hour=MARKET_OPEN_H, minute=MARKET_OPEN_M, second=0, microsecond=0).time()
+    return t < open_t
+
+
+def get_next_trading_day_from(dt):
+    candidate = dt + timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def get_last_trading_day_from(dt):
+    candidate = dt - timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate -= timedelta(days=1)
+    return candidate
+
+
+def get_prediction_context() -> dict:
+    """
+    核心函式：根據當前時間決定預測情境。
+    返回 dict，key 見下方四個分支。
+    """
+    now = datetime.now(HKT)
+    today = now.date()
+
+    result = {
+        "now_hkt"      : now,
+        "today_str"    : today.strftime("%Y-%m-%d"),
+        "now_time_str" : now.strftime("%H:%M:%S"),
+        "now_hkt_str"  : now.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+    if not is_weekday(now):
+        last_trading = get_last_trading_day_from(datetime.combine(today, datetime.min.time()))
+        next_trading = get_next_trading_day_from(datetime.combine(today, datetime.min.time()))
+        result.update({
+            "scenario": 4, "scenario_desc": "週末 → 預測下一交易日",
+            "predict_date_str": next_trading.strftime("%Y-%m-%d"),
+            "base_date_str": last_trading.strftime("%Y-%m-%d"),
+            "use_intraday": False, "intraday_avail": "無（週末）",
+            "data_note": f"使用 {last_trading.strftime('%Y-%m-%d')} 收市數據預測 {next_trading.strftime('%Y-%m-%d')}",
+        })
+
+    elif is_after_close(now):
+        next_trading = get_next_trading_day_from(datetime.combine(today, datetime.min.time()))
+        result.update({
+            "scenario": 1, "scenario_desc": "平日收市後 → 預測明日",
+            "predict_date_str": next_trading.strftime("%Y-%m-%d"),
+            "base_date_str": today.strftime("%Y-%m-%d"),
+            "use_intraday": False, "intraday_avail": "今日收市數據已可用",
+            "data_note": f"使用今日（{today}）完整收市數據，預測 {next_trading.strftime('%Y-%m-%d')}",
+        })
+
+    elif is_before_open(now):
+        last_trading = get_last_trading_day_from(datetime.combine(today, datetime.min.time()))
+        result.update({
+            "scenario": 2, "scenario_desc": "開市前 → 預測今日（昨收數據）",
+            "predict_date_str": today.strftime("%Y-%m-%d"),
+            "base_date_str": last_trading.strftime("%Y-%m-%d"),
+            "use_intraday": False, "intraday_avail": "未開市，無日內數據",
+            "data_note": f"使用昨日（{last_trading.strftime('%Y-%m-%d')}）收市數據，預測今日 {today}",
+        })
+
+    elif is_market_hours(now):
+        t = now.time()
+        if t.hour < 10:
+            intraday_qual, intraday_pct = "早盤（數據有限）", 0.1
+        elif t.hour < 12:
+            intraday_qual, intraday_pct = "上午盤（數據中等）", 0.4
+        elif t.hour < 14:
+            intraday_qual, intraday_pct = "午後（數據較好）", 0.6
+        else:
+            intraday_qual, intraday_pct = "尾市（數據充足）", 0.85
+
+        last_trading = get_last_trading_day_from(datetime.combine(today, datetime.min.time()))
+        result.update({
+            "scenario": 3, "scenario_desc": f"開市中 → 預測今日（{intraday_qual}）",
+            "predict_date_str": today.strftime("%Y-%m-%d"),
+            "base_date_str": last_trading.strftime("%Y-%m-%d"),
+            "use_intraday": True, "intraday_avail": intraday_qual, "intraday_pct": intraday_pct,
+            "data_note": f"使用昨收 + 今日實時數據（{intraday_qual}），預測今日 {today} 收市方向",
+        })
+
+    else:
+        last_trading = get_last_trading_day_from(datetime.combine(today, datetime.min.time()))
+        next_trading = get_next_trading_day_from(datetime.combine(today, datetime.min.time()))
+        result.update({
+            "scenario": 1, "scenario_desc": "其他情況 → 預測明日",
+            "predict_date_str": next_trading.strftime("%Y-%m-%d"),
+            "base_date_str": last_trading.strftime("%Y-%m-%d"),
+            "use_intraday": False, "intraday_avail": "未知",
+            "data_note": "使用最後已知收市數據",
+        })
+
+    return result
+
+
+CTX = get_prediction_context()
+
+
+def refresh_ctx() -> dict:
+    """
+    [Fix 3] CTX 是 import 當下的快照，不會隨時間自動更新。
+    任何需要『最新』情境判斷的下游模組（email_report.py、
+    daily_pipeline.py 最終輸出階段）應呼叫此函式取得新鮮結果，
+    而非直接讀取模組載入時凍結的 config.CTX。
+    對應原始 notebook Cell 21b/22/24/28/29B/30 重新呼叫
+    get_prediction_context() 的行為。
+    """
+    return get_prediction_context()
 
 
 # ============================================================
@@ -344,8 +523,6 @@ class RegimeThresholdCalibrator:
                         best_score = score
                         best_long  = lt
                         best_short = st
-
-            
 
             self.thresholds[regime] = {
                 "long":  round(best_long,  2),
@@ -481,7 +658,14 @@ class DynamicEnsembleWeighter:
 
 # ============================================================
 # Singleton 實例 — 由 training.py / daily_pipeline.py 共用，
-# 並透過 state['threshold_calibrator'] 等 key 持久化/還原
+# 並透過 state['threshold_calibrator'] 等 key 持久化/還原。
+#
+# [Fix 4 — 套用於 training.py，非本檔案] 任何模組需要讀取/更新
+# 這三個 singleton 時，必須用 `from src import config as cfg` 再經
+# `cfg.threshold_calibrator` 存取，不可用
+# `from src.config import threshold_calibrator` 直接 import 名稱，
+# 否則 load_pipeline_state() 還原狀態後，該模組手上的 reference
+# 仍指向 import 當下的舊物件，狀態還原會被靜默忽略。
 # ============================================================
 threshold_calibrator = RegimeThresholdCalibrator()
 position_sizer       = PositionSizer(
@@ -493,10 +677,10 @@ ensemble_weighter    = DynamicEnsembleWeighter(window=60, min_weight=0.2)
 # ============================================================
 # 持久化相關路徑與 state keys
 # ============================================================
-MODELS_DIR = "models"
+MODELS_DIR  = "models"
 RESULTS_DIR = "results"
-STATE_DIR  = "state"
-STATE_PATH = os.path.join(STATE_DIR, "pipeline_state.pkl")
+STATE_DIR   = "state"
+STATE_PATH  = os.path.join(STATE_DIR, "pipeline_state.pkl")
 
 STATE_KEYS = [
     "df_all", "feat_cols",
