@@ -31,8 +31,11 @@ from sklearn.metrics import accuracy_score, roc_auc_score
 
 from src import config as cfg
 from src.models import train_lgbm, align_features, safe_predict
+from sklearn.calibration import CalibratedClassifierCV
+import lightgbm as lgb
 
 
+  
 # ============================================================
 # 常數：直接複用 config.py 既有定義，不重複定義
 # ============================================================
@@ -44,11 +47,16 @@ STOCK_SIM_START   = cfg.STOCK_SIM_START
 STOCK_MIN_HISTORY = cfg.STOCK_MIN_HISTORY
 STOCK_TOP_N       = cfg.STOCK_TOP_N
 
+# 原 Colab 的 main_net/xlarge_net/large_net/retail_net 等10個欄位
+# 依賴 AkShare 的 stock_individual_fund_flow()，該介面主要支援A股，
+# 對港股支援度不穩定，故改用南向資金持股變化作為替代資金流特徵
+# （評估結論：選項1，資料真實可取得，但欄位結構與原版不同）。
 _FLOW_COLS = [
-    "main_net", "xlarge_net", "large_net", "retail_net",
-    "main_net_z20", "main_net_cum5", "smart_vs_retail",
-    "institutional_net", "flow_streak3", "flow_to_mcap",
+    "southbound_hold_chg_1d",
+    "southbound_hold_chg_5d",
+    "southbound_hold_pct",
 ]
+
 
 _EXCLUDE_COLS = {
     "date", "target", "next_ret",
@@ -154,6 +162,39 @@ def download_stock(
     df["sector"] = SECTOR_MAP.get(ticker, "其他")
     return df
 
+# ============================================================
+# 1b. 南向資金持股數據（取代原 _FLOW_COLS 的主力/大單拆分，
+#     因 AkShare 無法穩定提供港股個股的主力資金流拆分）
+# ============================================================
+def fetch_southbound_holding(ticker: str) -> pd.DataFrame | None:
+    """
+    取得單一港股的南向資金（港股通）每日持股變化。
+    ticker 格式如 "0700.HK" -> 轉換為 AkShare 要求的 "00700"
+    """
+    import akshare as ak
+
+    code = ticker.replace(".HK", "").zfill(5)
+    try:
+        df = ak.stock_hsgt_individual_em(symbol=code)
+    except Exception as e:
+        print(f"  ⚠️  {ticker} 南向資金數據取得失敗: {e}")
+        return None
+
+    if df is None or len(df) == 0:
+        return None
+
+    df = df.rename(columns={
+        "持股日期": "date",
+        "持股数量": "hold_shares",
+        "持股市值": "hold_value",
+        "持股数量占流通股比": "southbound_hold_pct",
+    })
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").reset_index(drop=True)
+    df["southbound_hold_chg_1d"] = df["hold_shares"].diff()
+    df["southbound_hold_chg_5d"] = df["hold_shares"].diff(5)
+
+    return df[["date", "southbound_hold_chg_1d", "southbound_hold_chg_5d", "southbound_hold_pct"]]
 
 # ============================================================
 # 2. [RECONSTRUCTED] 情境1盤中補數據（單行 DataFrame 版）
@@ -273,6 +314,9 @@ def build_stock_features(
         df["beta_60"] = np.nan
 
     # ── 資金流欄位（若上游已合併 Stock Connect flow 資料則保留，否則補 NaN）──
+    # ── 資金流欄位：南向資金持股變化（若呼叫端已合併則保留，否則補 NaN）──
+    # 呼叫端應先呼叫 fetch_southbound_holding() 並 merge 到 df 再傳入本函式，
+    # 本函式僅做欄位存在性保護，不主動下載（避免重複網路請求）。
     for c in _FLOW_COLS:
         if c not in df.columns:
             df[c] = np.nan
@@ -316,6 +360,30 @@ def _ensemble_predict_proba(models: list, X: pd.DataFrame) -> np.ndarray:
         return np.full(len(X), 0.5)
     return np.mean(probs, axis=0)
 
+# ============================================================
+# 5b. 自訂 seed 版 LightGBM 訓練（複製 models.train_lgbm() 邏輯，
+#     不修改共用檔案，僅本模組使用）
+# ============================================================
+def _train_lgbm_seeded(X_tr, y_tr, X_val, y_val, seed: int):
+    """
+    與 models.train_lgbm() 邏輯一致，額外支援自訂 random_state/bagging_seed，
+    用於個股多 seed 集成訓練。
+    """
+    try:
+        params = {**cfg.LGBM_PARAMS, "random_state": seed, "bagging_seed": seed}
+        model = lgb.LGBMClassifier(**params)
+        model.fit(
+            X_tr, y_tr,
+            eval_set  = [(X_val, y_val)],
+            callbacks = [lgb.early_stopping(40, verbose=False),
+                         lgb.log_evaluation(period=-1)]
+        )
+        cal = CalibratedClassifierCV(model, method="isotonic", cv="prefit")
+        cal.fit(X_val, y_val)
+        return cal
+    except Exception as e:
+        print(f"    ⚠️  seed={seed} 訓練失敗: {e}")
+        return None
 
 # ============================================================
 # 6. 個股獨立模型訓練（Cell 22/23 對應，每股一個模型）
@@ -349,14 +417,15 @@ def train_stock_models(
             continue
 
         vc = int(len(train_df) * 0.85)
+        X_tr  = align_features(train_df.iloc[:vc][feat_cols], feat_cols)
+        y_tr  = train_df.iloc[:vc]["target"]
+        X_val = align_features(train_df.iloc[vc:][feat_cols], feat_cols)
+        y_val = train_df.iloc[vc:]["target"]
+
         seed_models = []
         try:
             for seed in range(n_seeds):
-                model, metrics = train_lgbm(
-                    train_df.iloc[:vc], train_df.iloc[vc:],
-                    feat_cols, "target",
-                    params_override={"random_state": seed, "bagging_seed": seed},
-                )
+                model = _train_lgbm_seeded(X_tr, y_tr, X_val, y_val, seed)
                 if model is not None:
                     seed_models.append(model)
 
@@ -364,9 +433,10 @@ def train_stock_models(
                 print(f"  ❌ {ticker}: 全部 seed 訓練失敗")
                 continue
 
-            val_X = align_features(train_df.iloc[vc:][feat_cols], feat_cols)
-            val_y = train_df.iloc[vc:]["target"]
+            val_X = X_val
+            val_y = y_val
             val_prob = _ensemble_predict_proba(seed_models, val_X)
+
             auc = roc_auc_score(val_y, val_prob) if val_y.nunique() > 1 else float("nan")
             acc = accuracy_score(val_y, (val_prob > 0.5).astype(int))
 
