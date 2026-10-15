@@ -4,8 +4,11 @@
 # 無狀態 runner 設計：
 #   - 若 state/models 已存在 → 增量更新 + 預測（不重訓全部）
 #   - 若首次執行（無 state）→ 完整 bootstrap（下載 + 初訓 + 模擬）
-# 個股預測（stock_model.run_stock_pipeline）獨立於 state 之外，
-# 失敗時不應中斷恆指核心流程（try/except 容錯）。
+#
+# 本版本整合：
+#   - 個股預測（stock_model.run_stock_pipeline），獨立 try/except 容錯
+#   - compute_backtest_report() 呼叫修正（接收 sim_df，非 state）
+#   - 盤中數據回填 + 技術指標全量重算（方式A）
 # ============================================================
 import os
 import sys
@@ -16,7 +19,9 @@ import pandas as pd
 
 from src import config
 from src.config import STATE_PATH, STATE_KEYS, MODELS_DIR, RESULTS_DIR
-from src.data_loader import download_all_data
+from src.data_loader import (
+    download_all_data, fetch_intraday_hsi, update_last_row_with_intraday,
+)
 from src.features import build_features
 from src.training import (
     run_initial_training, run_daily_simulation,
@@ -79,6 +84,37 @@ def save_pipeline_state(state: dict) -> None:
 
 
 # ============================================================
+# 盤中數據回填（方式A：更新OHLC後，全量重跑 build_features()）
+# ============================================================
+def _apply_intraday_update(df_all: pd.DataFrame) -> pd.DataFrame:
+    """
+    情境3（盤中執行）時，用即時報價更新 df_all 最後一行的 OHLC，
+    再對整個 df_all 重新計算技術指標，確保 RSI/MACD/布林通道等
+    與最新價格一致（方式A，已與使用者確認採用）。
+    """
+    ctx = config.get_prediction_context()
+    scenario = ctx["scenario"]
+
+    if scenario != 3:
+        return df_all
+
+    print("  📡 情境3（盤中）：取得即時報價並回填最後一行...")
+    intraday = fetch_intraday_hsi(fallback_df=df_all)
+    if intraday is None:
+        print("  ⚠️  盤中報價全部來源失敗，沿用原始收盤數據")
+        return df_all
+
+    last_row_updated = update_last_row_with_intraday(df_all.iloc[[-1]], intraday)
+    df_all = df_all.copy()
+    df_all.iloc[-1] = last_row_updated.iloc[0]
+
+    print("  🔄 重新計算全部技術指標（方式A：全量重跑 build_features）...")
+    df_all = build_features(df_all)
+
+    return df_all
+
+
+# ============================================================
 # Bootstrap / 增量更新 / 預測
 # ============================================================
 def run_full_bootstrap() -> dict:
@@ -88,10 +124,12 @@ def run_full_bootstrap() -> dict:
 
     df_all = download_all_data()
     df_all = build_features(df_all)
+    df_all = _apply_intraday_update(df_all)
 
     state = run_initial_training(df_all)
-    sim_df = run_daily_simulation(state)          # run_daily_simulation 就地更新 state，並回傳 sim_df
+    sim_df = run_daily_simulation(state)
     state["last_backtest_report"] = compute_backtest_report(sim_df)
+
     return state
 
 
@@ -102,10 +140,12 @@ def run_incremental_update(state: dict) -> dict:
 
     df_all = download_all_data()
     df_all = build_features(df_all)
+    df_all = _apply_intraday_update(df_all)
     state["df_all"] = df_all
 
     sim_df = run_daily_simulation(state)
     state["last_backtest_report"] = compute_backtest_report(sim_df)
+
     return state
 
 
