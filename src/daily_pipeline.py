@@ -1,193 +1,201 @@
 # ============================================================
 # src/daily_pipeline.py
-# [RECONSTRUCTED ORCHESTRATOR] — ties together all modules for
-# the GitHub Actions daily run. The original Colab "daily update"
-# cells (live prediction for the next trading day) were not pasted
-# into this conversation, so this is built from the established
-# state-persistence design, not ported verbatim. Please diff
-# against your actual Cell 9+ logic if you still have it.
+# GitHub Actions 入口：每個 weekday 09:00 HKT 執行一次。
+# 無狀態 runner 設計：
+#   - 若 state/models 已存在 → 增量更新 + 預測（不重訓全部）
+#   - 若首次執行（無 state）→ 完整 bootstrap（下載 + 初訓 + 模擬）
 # ============================================================
 import os
-import sys
-import traceback
-from datetime import datetime
-
 import joblib
 import pandas as pd
-import pytz
 
-from src.config import STATE_PATH, MODELS_DIR, RESULTS_DIR, STATE_KEYS
-from src.data_loader import load_all_data
-from src.features import build_features, get_feat_cols
-from src.models import safe_predict, get_market_trend
-from src.hl_model import build_hl_targets, build_hl_features, get_hl_feat_cols
+from src import config
+from src.config import STATE_PATH, STATE_KEYS, MODELS_DIR, RESULTS_DIR
+from src.data_loader import download_all_data
+from src.features import build_features
 from src.training import (
     run_initial_training, run_daily_simulation,
     save_models, load_models, compute_backtest_report,
 )
+from src.models import safe_predict, align_features
 
-HKT = pytz.timezone("Asia/Hong_Kong")
 
-
+# ============================================================
+# State persistence
+# ============================================================
 def load_pipeline_state() -> dict:
     """
-    Load persisted state dict (models + adaptive components) from
-    state/pipeline_state.pkl. Returns {} if not found, signalling
-    the caller to run full initial training instead.
+    從 state/pipeline_state.pkl 載入上次執行狀態。
+    關鍵修正：threshold_calibrator / position_sizer / ensemble_weighter
+    是 config.py 的 module-level singleton，必須在此用 state 裡已學習到
+    的物件「覆蓋」config 模組變數，否則每次 process 重啟都會退回
+    default 0.5/0.5 權重，等於白學。
     """
     if not os.path.exists(STATE_PATH):
-        print(f"  ⚠️  {STATE_PATH} 不存在 → 需執行完整初始訓練")
+        print(f"  ℹ️  {STATE_PATH} 不存在 → 視為首次執行")
         return {}
+
     try:
         state = joblib.load(STATE_PATH)
-        missing = [k for k in STATE_KEYS if k not in state]
-        if missing:
-            print(f"  ⚠️  state 缺少欄位 {missing} → 需執行完整初始訓練")
-            return {}
-        print(f"  ✅ state 已從 {STATE_PATH} 載入 "
-              f"({len(STATE_KEYS)} 個元件)")
-        return state
     except Exception as e:
-        print(f"  ⚠️  state 載入失敗: {e} → 需執行完整初始訓練")
+        print(f"  ⚠️  state 載入失敗: {e} → 視為首次執行")
         return {}
 
+    # ── 關鍵修正：還原自學 singleton 到 config 模組 ──────────
+    if "threshold_calibrator" in state:
+        config.threshold_calibrator = state["threshold_calibrator"]
+    if "position_sizer" in state:
+        config.position_sizer = state["position_sizer"]
+    if "ensemble_weighter" in state:
+        config.ensemble_weighter = state["ensemble_weighter"]
 
-def save_pipeline_state(state: dict) -> None:
-    """Persist state dict (only STATE_KEYS fields) to disk."""
-    os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
-    slim_state = {k: state[k] for k in STATE_KEYS if k in state}
-    joblib.dump(slim_state, STATE_PATH)
-    print(f"  ✅ state 已儲存至 {STATE_PATH}")
+    # ── 模型檔案獨立存於 models/，而非塞進 pickle 內 ─────────
+    model_state = load_models(MODELS_DIR)
+    if model_state:
+        state.update(model_state)
+    else:
+        print("  ⚠️  models/ 缺失但 state 存在 → 視為不完整，需 bootstrap")
+        return {}
 
+    missing = [k for k in ("global_model", "hmm", "feat_cols") if k not in state]
+    if missing:
+        print(f"  ⚠️  state 缺少關鍵欄位 {missing} → 視為不完整")
+        return {}
 
-def run_full_bootstrap() -> dict:
-    """
-    First-ever run (no state file exists yet): download full
-    history, run initial training + simulation, persist everything.
-    """
-    print("=" * 60)
-    print("  🔄 FULL BOOTSTRAP (無既有 state，從零訓練)")
-    print("=" * 60)
-
-    df_all = load_all_data()
-    state  = run_initial_training(df_all)
-    sim_df = run_daily_simulation(state)
-
-    report = compute_backtest_report(sim_df)
-    state["last_backtest_report"] = report
-    state["sim_df"] = sim_df
-
-    save_models(state, out_dir=MODELS_DIR)
-    save_pipeline_state(state)
-
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    sim_df.to_csv(os.path.join(RESULTS_DIR, "sim_history.csv"), index=False)
-
+    print(f"  ✅ state 已載入，包含 {len(state)} 個欄位")
     return state
 
 
+def save_pipeline_state(state: dict) -> None:
+    """
+    拆分儲存：
+      - 大型模型物件 (global_model/regime_models/hmm/feat_cols)
+        → save_models() 寫入 models/（Cell 7B 邏輯）
+      - 其餘自學狀態 + 最新 df_all/backtest report
+        → joblib.dump 整包寫入 state/pipeline_state.pkl
+    config 模組的 singleton 在儲存前先同步進 state dict，
+    確保下次 load 時能正確還原。
+    """
+    os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+
+    save_models(state, MODELS_DIR)
+
+    state["threshold_calibrator"] = config.threshold_calibrator
+    state["position_sizer"]       = config.position_sizer
+    state["ensemble_weighter"]    = config.ensemble_weighter
+
+    persist_state = {k: state[k] for k in STATE_KEYS if k in state}
+    joblib.dump(persist_state, STATE_PATH)
+
+    print(f"  ✅ state 已儲存至 {STATE_PATH}（{len(persist_state)} 個欄位）")
+
+
+# ============================================================
+# Bootstrap：首次執行，無既有 state/models
+# ============================================================
+def run_full_bootstrap() -> dict:
+    print("=" * 60)
+    print("  Full Bootstrap（首次執行 / state 不完整）")
+    print("=" * 60)
+
+    df_raw  = download_all_data()
+    df_feat = build_features(df_raw)
+
+    state = run_initial_training(df_feat)
+
+    sim_df = run_daily_simulation(state)
+    report = compute_backtest_report(sim_df)
+    state["last_backtest_report"] = report
+
+    sim_df.to_csv(os.path.join(RESULTS_DIR, "sim_records.csv"), index=False)
+
+    save_pipeline_state(state)
+    print("✅ run_full_bootstrap() 完成")
+    return state
+
+
+# ============================================================
+# 增量更新：已有 state/models，只需追加新一天資料
+# ============================================================
 def run_incremental_update(state: dict) -> dict:
-    """
-    Normal daily run: state already exists. Pull latest data,
-    append to history, let run_daily_simulation() process any new
-    rows (triggers retrain only if drift/perf-degradation fires),
-    then persist.
-    """
     print("=" * 60)
-    print("  🔁 INCREMENTAL DAILY UPDATE")
+    print("  Incremental Update（增量更新）")
     print("=" * 60)
 
-    df_all = load_all_data()
-    state["df_all"] = df_all
+    df_raw  = download_all_data()
+    df_feat = build_features(df_raw)
 
+    state["df_all"]    = df_feat
+    hmm                = state["hmm"]
     try:
-        df_all = state["hmm"].add_features(df_all)
-        state["df_all"] = df_all
+        state["df_all"] = hmm.add_features(df_feat)
     except Exception as e:
         print(f"  ⚠️  HMM add_features 失敗: {e}")
 
     sim_df = run_daily_simulation(state)
-
     report = compute_backtest_report(sim_df)
     state["last_backtest_report"] = report
-    state["sim_df"] = sim_df
 
-    save_models(state, out_dir=MODELS_DIR)
+    sim_df.to_csv(os.path.join(RESULTS_DIR, "sim_records.csv"), index=False)
+
     save_pipeline_state(state)
-
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    sim_df.to_csv(os.path.join(RESULTS_DIR, "sim_history.csv"), index=False)
-
+    print("✅ run_incremental_update() 完成")
     return state
 
 
+# ============================================================
+# 隔日預測（Cell 9 邏輯對應）
+# ============================================================
 def predict_next_day(state: dict) -> dict:
-    """
-    Generate the live, forward-looking prediction for the next
-    trading day using the latest row of known data and the current
-    (possibly just-retrained) global_model + regime_models.
-    """
-    from src.config import threshold_calibrator, position_sizer, ensemble_weighter
-
     df_all    = state["df_all"]
     feat_cols = state["feat_cols"]
-    hmm       = state["hmm"]
+    global_model  = state["global_model"]
+    regime_models = state["regime_models"]
 
-    last_known = df_all.iloc[[-1]]
-    last_date  = pd.Timestamp(last_known["date"].values[0])
+    last_row = df_all.iloc[[-1]]
+    regime = (str(last_row["hmm_regime"].values[0])
+              if "hmm_regime" in last_row.columns else "neutral")
 
-    g_prob = safe_predict(state["global_model"], last_known, feat_cols)
-
-    regime = (str(last_known["hmm_regime"].values[0])
-              if "hmm_regime" in last_known.columns else "neutral")
-
+    g_prob = safe_predict(global_model, last_row, feat_cols)
     r_prob = g_prob
-    if regime in state["regime_models"]:
-        r_prob = safe_predict(state["regime_models"][regime], last_known, feat_cols)
+    if regime in regime_models:
+        r_prob = safe_predict(regime_models[regime], last_row, feat_cols)
 
-    ens_prob = ensemble_weighter.ensemble(g_prob, r_prob)
-    signal   = threshold_calibrator.get_signal(ens_prob, regime)
+    ens_prob = config.ensemble_weighter.ensemble(g_prob, r_prob)
+    signal_code = config.threshold_calibrator.get_signal(ens_prob, regime)
+    signal = {1: "LONG", -1: "SHORT", 0: "NEUTRAL"}[signal_code]
 
-    market_trend = get_market_trend(df_all, window=20)
-    if market_trend == "bear" and signal == 1 and ens_prob < 0.65:
-        signal = 0
-
-    roll_acc = state["monitor"].rolling_accuracy()
-    position_size = position_sizer.compute_size(
-        prob=ens_prob, signal=signal, regime=regime, roll_acc=roll_acc,
+    position_size = config.position_sizer.compute_size(
+        prob=ens_prob, signal=signal_code, regime=regime, roll_acc=0.5,
     )
 
-    result = {
-        "as_of_date"   : last_date.strftime("%Y-%m-%d"),
-        "predict_for"  : "next trading day",
+    prediction = {
+        "as_of_date"   : pd.Timestamp(df_all["date"].iloc[-1]).strftime("%Y-%m-%d"),
         "regime"       : regime,
         "global_prob"  : round(g_prob,   4),
         "regime_prob"  : round(r_prob,   4),
         "ensemble_prob": round(ens_prob, 4),
-        "signal"       : {1: "LONG", 0: "NEUTRAL", -1: "SHORT"}[signal],
+        "signal"       : signal,
         "position_size": round(position_size, 4),
-        "market_trend" : market_trend,
-        "roll_acc"     : round(roll_acc, 4),
     }
 
-    print("\n" + "=" * 60)
-    print("  📈 下一交易日預測")
-    print("=" * 60)
-    for k, v in result.items():
-        print(f"    {k:14s}: {v}")
-    print("=" * 60)
-
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    joblib.dump(result, os.path.join(RESULTS_DIR, "latest_prediction.pkl"))
+    joblib.dump(prediction, os.path.join(RESULTS_DIR, "latest_prediction.pkl"))
 
-    return result
+    print("\n" + "=" * 60)
+    print("  📈 隔日預測結果")
+    print("=" * 60)
+    for k, v in prediction.items():
+        print(f"  {k:14s}: {v}")
+    print("=" * 60)
+
+    return prediction
 
 
+# ============================================================
+# Entry point
+# ============================================================
 def main():
-    """Entry point invoked by GitHub Actions (.github/workflows/daily.yml)."""
-    now_hkt = datetime.now(HKT)
-    print(f"🚀 HSI Daily Pipeline — {now_hkt.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-
     try:
         state = load_pipeline_state()
 
@@ -196,19 +204,18 @@ def main():
         else:
             state = run_incremental_update(state)
 
-        prediction = predict_next_day(state)
+        predict_next_day(state)
 
         print("  ℹ️  Email 將在 charts 生成後，由獨立 workflow step 發送")
-
         print("\n✅ daily_pipeline.py 執行完成")
         return 0
 
-
     except Exception as e:
-        print(f"\n❌ Pipeline 執行失敗: {e}")
+        import traceback
+        print(f"\n❌ daily_pipeline.py 執行失敗: {e}")
         traceback.print_exc()
         return 1
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    exit(main())
