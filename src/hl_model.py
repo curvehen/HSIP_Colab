@@ -210,18 +210,23 @@ def train_hl_model(train_df: pd.DataFrame, target_col: str, hl_feat_cols: list):
     X_val = align_features(train_df[hl_feat_cols].iloc[vc:], hl_feat_cols)
     y_val = train_df[target_col].iloc[vc:]
 
-    model = lgb.LGBMRegressor(**LGBM_REG_PARAMS)
-    model.fit(
-        X_tr, y_tr,
-        eval_set  = [(X_val, y_val)],
-        callbacks = [lgb.early_stopping(40, verbose=False),
-                     lgb.log_evaluation(period=-1)]
-    )
+    try:
+        model = lgb.LGBMRegressor(**LGBM_REG_PARAMS)
+        model.fit(
+            X_tr, y_tr,
+            eval_set  = [(X_val, y_val)],
+            callbacks = [lgb.early_stopping(40, verbose=False),
+                         lgb.log_evaluation(period=-1)]
+        )
 
-    pred = model.predict(X_val)
-    mae  = mean_absolute_error(y_val, pred)
-    r2   = r2_score(y_val, pred)
-    return model, mae, r2
+        pred = model.predict(X_val)
+        mae  = mean_absolute_error(y_val, pred)
+        r2   = r2_score(y_val, pred)
+        return model, mae, r2
+    except Exception as e:
+        print(f"    ⚠️  HL訓練失敗 ({target_col}): {e}")
+        return None, 999.0, -999.0
+
 
 
 def train_all_hl_models(df_train_hl: pd.DataFrame, hl_feat_cols: list) -> tuple:
