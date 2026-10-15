@@ -2,6 +2,7 @@
 # src/training.py
 # Merged from: Cell 6 (初始訓練), Cell 7 (逐日模擬 + do_retrain_fixed),
 #              Cell 7B (模型儲存), Cell 8 (回測績效計算)
+# HL (高低位) 模型整合：依共識接入初訓/重訓/持久化流程
 # ============================================================
 import os
 import joblib
@@ -53,7 +54,7 @@ def run_initial_training(df_all: pd.DataFrame) -> dict:
     print(f"  模擬集: {len(df_sim)} 行 | "
           f"{df_sim['date'].min().date()} → {df_sim['date'].max().date()}")
 
-    # ── HMM Regime ────────────────────────────────────────────
+    # ── HMM Regime ──────────────────────────────────────────
     print("\n  訓練 HMM Regime 分類器...")
     hmm = HMMRegime(n_states=3)
     hmm.fit(df_train)
@@ -61,12 +62,12 @@ def run_initial_training(df_all: pd.DataFrame) -> dict:
     df_train = df_all[train_mask].copy().reset_index(drop=True)
     df_sim   = df_all[sim_mask].copy().reset_index(drop=True)
 
-    print(f"  Regime 分佈（訓練集）:")
+    print(f"  Regime 分布（訓練集）:")
     print(df_train["hmm_regime"].value_counts().to_string())
 
     feat_cols = get_feat_cols(df_all)
 
-    # ── 初始模型訓練 ─────────────────────────────────────────
+    # ── 初始模型訓練 ──────────────────────────────────────────
     print("\n  訓練初始 LightGBM 模型...")
     val_cut  = int(len(df_train) * 0.80)
     X_tr     = df_train[feat_cols].iloc[:val_cut]
@@ -82,7 +83,7 @@ def run_initial_training(df_all: pd.DataFrame) -> dict:
     print(f"    命中率   : {init_metrics['accuracy']:.2%}")
     print(f"    Brier    : {init_metrics['brier']:.4f}")
 
-    # ── 按 Regime 分拆模型 ───────────────────────────────────
+    # ── 按 Regime 分拆模型 ──────────────────────────────────
     print("\n  訓練 Regime-specific 模型...")
     regime_models = {}
     for regime in ["bull", "bear", "neutral"]:
@@ -106,7 +107,7 @@ def run_initial_training(df_all: pd.DataFrame) -> dict:
         except Exception as e:
             print(f"    {regime}: 訓練失敗 {e}")
 
-    # ── 初始化自學組件 ───────────────────────────────────────
+    # ── 初始化自學組件 ──────────────────────────────────────
     monitor = PerfMonitor()
     memory  = ModelMemory()
     memory.save(init_model, init_metrics["auc"], {"phase": "init"})
@@ -129,7 +130,8 @@ def run_initial_training(df_all: pd.DataFrame) -> dict:
     joblib.dump(feat_cols_fixed, "models/feat_cols_fixed.pkl")
     print(f"  feat_cols_fixed.pkl saved: {len(feat_cols_fixed)} features")
 
-    # ── 訓練 HL (高低位) 模型 ──────────────────────────────────
+    # ── 訓練 HL (高低位) 模型 ──────────────────────────────
+    # 依共識接入，失敗不阻擋主流程（HL 屬附加功能）
     print("\n  訓練 HL (高低位) 模型...")
     try:
         df_hl = build_hl_targets(df_all)
@@ -162,7 +164,6 @@ def run_initial_training(df_all: pd.DataFrame) -> dict:
         "hl_feat_cols" : hl_feat_cols,
         "hl_metrics"   : hl_metrics,
     }
-
 
 
 # ============================================================
@@ -228,7 +229,8 @@ def do_retrain_fixed(train_df, reasons, fold_idx, feat_cols, state: dict) -> str
             if rm is not None:
                 regime_models[regime] = rm
 
-    # ── HL (高低位) 模型同步重訓 ──────────────────────────────
+    # ── HL (高低位) 模型同步重訓 ──────────────────────────
+    # 依共識：沿用分類模型的觸發條件，不設獨立判斷邏輯
     hl_feat_cols = state.get("hl_feat_cols")
     if hl_feat_cols:
         try:
@@ -247,7 +249,6 @@ def do_retrain_fixed(train_df, reasons, fold_idx, feat_cols, state: dict) -> str
     state["hmm"]            = hmm
 
     return action
-
 
 
 # ============================================================
@@ -321,26 +322,26 @@ def run_daily_simulation(state: dict) -> pd.DataFrame:
         if sim_idx > 0 and len(sim_records) > 0:
             prev = sim_records[-1]
             if "actual_target" in prev:
-                ensemble_weighter.update("global", prev["global_prob"], prev["actual_target"])
-                ensemble_weighter.update("regime", prev["regime_prob"], prev["actual_target"])
+                cfg.ensemble_weighter.update("global", prev["global_prob"], prev["actual_target"])
+                cfg.ensemble_weighter.update("regime", prev["regime_prob"], prev["actual_target"])
 
-        ens_prob = ensemble_weighter.ensemble(g_prob, r_prob)
+        ens_prob = cfg.ensemble_weighter.ensemble(g_prob, r_prob)
 
         if sim_idx == 60 and len(sim_records) >= 30:
             cal_df = pd.DataFrame(sim_records)
             if all(c in cal_df.columns for c in ["regime", "ensemble_prob", "actual_target"]):
-                threshold_calibrator.calibrate(
+                cfg.threshold_calibrator.calibrate(
                     cal_df, prob_col="ensemble_prob",
                     target_col="actual_target", regime_col="regime")
 
         if sim_idx > 60 and sim_idx % 42 == 0 and len(sim_records) >= 60:
             cal_df = pd.DataFrame(sim_records[-120:])
             if all(c in cal_df.columns for c in ["regime", "ensemble_prob", "actual_target"]):
-                threshold_calibrator.calibrate(
+                cfg.threshold_calibrator.calibrate(
                     cal_df, prob_col="ensemble_prob",
                     target_col="actual_target", regime_col="regime")
 
-        signal = threshold_calibrator.get_signal(ens_prob, regime)
+        signal = cfg.threshold_calibrator.get_signal(ens_prob, regime)
 
         market_trend = get_market_trend(known_df, window=20)
 
@@ -358,7 +359,7 @@ def run_daily_simulation(state: dict) -> pd.DataFrame:
         if sim_idx > 20 and roll_acc < 0.40:
             signal = 0
 
-        position_size = position_sizer.compute_size(
+        position_size = cfg.position_sizer.compute_size(
             prob=ens_prob, signal=signal, regime=regime,
             roll_acc=roll_acc if sim_idx > 5 else 0.5,
         )
@@ -426,107 +427,113 @@ def run_daily_simulation(state: dict) -> pd.DataFrame:
 
             days_since_retrain = 0
 
+       
         month_key = sim_date.strftime("%Y-%m")
         if month_key not in wf_monthly:
-            wf_monthly[month_key] = {"trades": 0, "correct": 0, "ret": 0.0, "long": 0, "short": 0}
-
+            wf_monthly[month_key] = {"ret": 0.0, "n_trades": 0, "n_correct": 0}
+        wf_monthly[month_key]["ret"]       += strat_ret
         if signal != 0:
-            wf_monthly[month_key]["trades"] += 1
-            wf_monthly[month_key]["ret"]    += strat_ret
-            if signal == 1:
-                wf_monthly[month_key]["long"]  += 1
-            else:
-                wf_monthly[month_key]["short"] += 1
+            wf_monthly[month_key]["n_trades"] += 1
             if correct:
-                wf_monthly[month_key]["correct"] += 1
+                wf_monthly[month_key]["n_correct"] += 1
 
         sim_records.append({
-            "date"               : sim_date,
-            "close"              : float(sim_row.get("close", 0)),
-            "regime"             : regime,
-            "global_prob"        : round(g_prob,          4),
-            "regime_prob"        : round(r_prob,          4),
-            "ensemble_prob"      : round(ens_prob,        4),
-            "signal"             : signal,
-            "position_size"      : round(position_size,   4),
-            "actual_ret"         : actual_ret,
-            "strat_ret"          : round(strat_ret,       6),
-            "actual_target"      : actual_target,
-            "correct"            : correct,
-            "retrain"            : do_rt,
-            "retrain_reason"     : ",".join(reasons),
-            "action"             : action,
-            "roll_acc"           : round(roll_acc,        4),
-            "roll_auc"           : round(roll_auc,        4),
-            "best_model_auc"     : round(memory.best_auc, 4),
-            "short_confirm_score": short_confirm["score"],
-            "ens_weight_summary" : ensemble_weighter.weight_summary(),
-            "market_trend"       : market_trend,
+            "date"          : sim_date,
+            "regime"        : regime,
+            "global_prob"   : g_prob,
+            "regime_prob"   : r_prob,
+            "ensemble_prob" : ens_prob,
+            "signal"        : signal,
+            "position_size" : position_size,
+            "actual_target" : actual_target,
+            "actual_ret"    : actual_ret,
+            "strat_ret"     : strat_ret,
+            "correct"       : correct,
+            "roll_acc"      : roll_acc,
+            "roll_auc"      : roll_auc,
+            "retrain"       : do_rt,
+            "retrain_action": action,
+            "market_trend"  : market_trend,
+            "short_confirmed": short_confirm.get("confirmed", False),
         })
 
     sim_df = pd.DataFrame(sim_records)
+    print(f"\n  ✅ 模擬完成，共 {len(sim_df)} 筆記錄")
 
-    if len(sim_df) == 0:
-        print("\n  ⚠️  無模擬記錄")
-        return sim_df
-
-    sim_df["cum_strat"]  = (1 + sim_df["strat_ret"]).cumprod()
-    sim_df["cum_market"] = (1 + sim_df["actual_ret"]).cumprod()
-
-    traded        = sim_df[sim_df["signal"] != 0]
-    total_trades  = len(traded)
-    n_correct     = traded["correct"].sum() if total_trades > 0 else 0
-    hit_rate      = n_correct / total_trades if total_trades > 0 else 0
-
-    daily_strat   = sim_df["strat_ret"]
-    sharpe        = (daily_strat.mean() / (daily_strat.std() + 1e-9) * np.sqrt(252))
-
-    cum_ret       = sim_df["cum_strat"]
-    rolling_max   = cum_ret.cummax()
-    drawdown      = (cum_ret - rolling_max) / (rolling_max + 1e-9)
-    max_drawdown  = drawdown.min()
-
-    total_return  = cum_ret.iloc[-1] - 1
-    market_return = sim_df["cum_market"].iloc[-1] - 1
-
-    n_retrains = int(sim_df["retrain"].sum())
-
-    print("\n" + "=" * 60)
-    print("  逐日模擬完成")
-    print("=" * 60)
-    print(f"  模擬天數       : {len(sim_df)}")
-    print(f"  交易次數       : {total_trades}")
-    print(f"  命中率         : {hit_rate:.2%}")
-    print(f"  策略總回報     : {total_return:.2%}")
-    print(f"  市場總回報     : {market_return:.2%}")
-    print(f"  Sharpe 比率    : {sharpe:.3f}")
-    print(f"  最大回撤       : {max_drawdown:.2%}")
-    print(f"  重訓練次數     : {n_retrains}")
-    print(f"  Rollback 次數  : {memory.rollbacks}")
-    print("=" * 60)
-
-    # ── 寫回最終 state ──────────────────────────────────────
+    # ── 更新 state（就地寫回最新模型引用）──────────────────
     state["global_model"]  = global_model
     state["regime_models"] = regime_models
     state["hmm"]           = hmm
-    state["monitor"]       = monitor
-    state["memory"]        = memory
-    state["drift"]         = drift
-    state["wf_monthly"]    = wf_monthly
-
-    print("✅ training.py: run_daily_simulation() 完成")
+    state["df_sim_result"] = sim_df
 
     return sim_df
 
 
 # ============================================================
-# Cell 7B: 模型持久化
+# Cell 8: 回測績效計算
+# ============================================================
+def compute_backtest_report(sim_df: pd.DataFrame) -> dict:
+    """
+    對應 Cell 8。接收 run_daily_simulation() 回傳的 sim_df，
+    計算 Sharpe / 最大回撤 / 命中率 / regime 拆解等指標。
+    """
+    if sim_df is None or len(sim_df) == 0:
+        return {}
+
+    rets = sim_df["strat_ret"]
+    equity = (1 + rets).cumprod()
+
+    sharpe = (
+        np.sqrt(252) * rets.mean() / rets.std()
+        if rets.std() > 0 else 0.0
+    )
+
+    running_max = equity.cummax()
+    drawdown    = (equity - running_max) / running_max
+    max_drawdown = drawdown.min()
+
+    traded = sim_df[sim_df["signal"] != 0]
+    hit_rate = (
+        traded["correct"].mean()
+        if len(traded) > 0 and traded["correct"].notna().any() else 0.0
+    )
+
+    regime_breakdown = {}
+    for regime in sim_df["regime"].unique():
+        rdf = sim_df[sim_df["regime"] == regime]
+        rtraded = rdf[rdf["signal"] != 0]
+        regime_breakdown[regime] = {
+            "n_days"   : len(rdf),
+            "n_trades" : len(rtraded),
+            "hit_rate" : (rtraded["correct"].mean()
+                          if len(rtraded) > 0 and rtraded["correct"].notna().any() else 0.0),
+            "total_ret": rdf["strat_ret"].sum(),
+        }
+
+    report = {
+        "sharpe"           : float(sharpe),
+        "max_drawdown"     : float(max_drawdown),
+        "hit_rate"         : float(hit_rate),
+        "total_return"     : float(equity.iloc[-1] - 1),
+        "n_trades"         : int(len(traded)),
+        "n_days"           : int(len(sim_df)),
+        "regime_breakdown" : regime_breakdown,
+    }
+
+    print("\n  📊 回測報告")
+    print(f"    Sharpe       : {report['sharpe']:.3f}")
+    print(f"    最大回撤     : {report['max_drawdown']:.2%}")
+    print(f"    命中率       : {report['hit_rate']:.2%}")
+    print(f"    總報酬       : {report['total_return']:.2%}")
+    print(f"    交易次數     : {report['n_trades']}")
+
+    return report
+
+
+# ============================================================
+# Cell 7B: 模型儲存 / 載入（含 HL 持久化）
 # ============================================================
 def save_models(state: dict, out_dir: str = "models") -> None:
-    """
-    對應 Cell 7B。將訓練/模擬完成後的模型與自學狀態物件
-    寫入磁碟，供 GitHub Actions 下次 run 時載入，避免每日重訓。
-    """
     os.makedirs(out_dir, exist_ok=True)
 
     global_model  = state["global_model"]
@@ -546,7 +553,7 @@ def save_models(state: dict, out_dir: str = "models") -> None:
         joblib.dump(list(base_m.feature_name_),
                     os.path.join(out_dir, "feat_cols_fixed.pkl"))
 
-    # ── HL (高低位) 模型持久化，缺失不影響主流程 ──────────────
+    # ── HL (高低位) 模型持久化，缺失不影響主流程 ──────────
     hl_models    = state.get("hl_models")
     hl_feat_cols = state.get("hl_feat_cols")
     if hl_models:
@@ -576,7 +583,7 @@ def load_models(in_dir: str = "models") -> dict:
     }
 
     # ── HL (高低位) 模型為附加功能，缺失不阻擋主流程 ──────────
-    hl_path          = os.path.join(in_dir, "hl_models.pkl")
+    hl_path           = os.path.join(in_dir, "hl_models.pkl")
     hl_feat_cols_path = os.path.join(in_dir, "hl_feat_cols.pkl")
     if os.path.exists(hl_path) and os.path.exists(hl_feat_cols_path):
         state["hl_models"]    = joblib.load(hl_path)
@@ -589,133 +596,3 @@ def load_models(in_dir: str = "models") -> dict:
 
     print(f"  ✅ 模型已從 {in_dir}/ 載入")
     return state
-
-
-
-# ============================================================
-# Cell 8: 回測績效報告
-# ============================================================
-def compute_backtest_report(sim_df: pd.DataFrame) -> dict:
-    """
-    對應 Cell 8。根據 run_daily_simulation() 產出的 sim_df
-    計算完整回測績效指標（年化報酬、月度統計、regime 分解等）。
-    """
-    if len(sim_df) == 0:
-        print("  ⚠️  sim_df 為空，無法計算回測報告")
-        return {}
-
-    traded = sim_df[sim_df["signal"] != 0].copy()
-
-    total_days    = len(sim_df)
-    total_trades  = len(traded)
-    n_correct     = int(traded["correct"].sum()) if total_trades > 0 else 0
-    hit_rate      = n_correct / total_trades if total_trades > 0 else 0.0
-
-    long_trades   = traded[traded["signal"] == 1]
-    short_trades  = traded[traded["signal"] == -1]
-    long_hit      = (long_trades["correct"].mean()
-                     if len(long_trades) > 0 else 0.0)
-    short_hit     = (short_trades["correct"].mean()
-                     if len(short_trades) > 0 else 0.0)
-
-    total_return  = float(sim_df["cum_strat"].iloc[-1]  - 1)
-    market_return = float(sim_df["cum_market"].iloc[-1] - 1)
-
-    n_years       = max(total_days / 252, 1e-6)
-    cagr          = (1 + total_return) ** (1 / n_years) - 1
-
-    daily_strat   = sim_df["strat_ret"]
-    sharpe        = float(daily_strat.mean() / (daily_strat.std() + 1e-9) * np.sqrt(252))
-    downside      = daily_strat[daily_strat < 0]
-    sortino       = float(
-        daily_strat.mean() / (downside.std() + 1e-9) * np.sqrt(252)
-        if len(downside) > 0 else 0.0
-    )
-
-    cum_ret       = sim_df["cum_strat"]
-    rolling_max   = cum_ret.cummax()
-    drawdown      = (cum_ret - rolling_max) / (rolling_max + 1e-9)
-    max_drawdown  = float(drawdown.min())
-    calmar        = float(cagr / abs(max_drawdown)) if max_drawdown != 0 else 0.0
-
-    win_trades    = traded[traded["strat_ret"] > 0]
-    loss_trades   = traded[traded["strat_ret"] < 0]
-    avg_win       = float(win_trades["strat_ret"].mean())  if len(win_trades)  > 0 else 0.0
-    avg_loss      = float(loss_trades["strat_ret"].mean()) if len(loss_trades) > 0 else 0.0
-    profit_factor = (
-        float(win_trades["strat_ret"].sum() / abs(loss_trades["strat_ret"].sum()))
-        if len(loss_trades) > 0 and loss_trades["strat_ret"].sum() != 0 else 0.0
-    )
-
-    # ── Regime 分解 ──────────────────────────────────────────
-    regime_breakdown = {}
-    for regime in ["bull", "bear", "neutral"]:
-        rdf = traded[traded["regime"] == regime]
-        if len(rdf) == 0:
-            continue
-        regime_breakdown[regime] = {
-            "trades"  : int(len(rdf)),
-            "hit_rate": round(float(rdf["correct"].mean()), 4),
-            "avg_ret" : round(float(rdf["strat_ret"].mean()), 6),
-        }
-
-    # ── 月度統計 ─────────────────────────────────────────────
-    sim_df["month"] = sim_df["date"].dt.strftime("%Y-%m")
-    monthly = (
-        sim_df.groupby("month")
-        .agg(
-            trades  = ("signal",    lambda s: int((s != 0).sum())),
-            ret     = ("strat_ret", "sum"),
-        )
-        .reset_index()
-    )
-    monthly_records = monthly.to_dict(orient="records")
-
-    report = {
-        "total_days"       : total_days,
-        "total_trades"     : total_trades,
-        "hit_rate"         : round(hit_rate, 4),
-        "long_trades"      : int(len(long_trades)),
-        "long_hit_rate"    : round(float(long_hit), 4),
-        "short_trades"     : int(len(short_trades)),
-        "short_hit_rate"   : round(float(short_hit), 4),
-        "total_return"     : round(total_return,  4),
-        "market_return"    : round(market_return, 4),
-        "cagr"             : round(cagr,     4),
-        "sharpe"           : round(sharpe,   4),
-        "sortino"          : round(sortino,  4),
-        "max_drawdown"     : round(max_drawdown, 4),
-        "calmar"           : round(calmar,   4),
-        "avg_win"          : round(avg_win,  6),
-        "avg_loss"         : round(avg_loss, 6),
-        "profit_factor"    : round(profit_factor, 4),
-        "regime_breakdown" : regime_breakdown,
-        "monthly"          : monthly_records,
-    }
-
-    print("\n" + "=" * 60)
-    print("  📊 回測績效報告 (Cell 8)")
-    print("=" * 60)
-    print(f"  總天數          : {report['total_days']}")
-    print(f"  交易次數        : {report['total_trades']} "
-          f"(多: {report['long_trades']} / 空: {report['short_trades']})")
-    print(f"  整體命中率      : {report['hit_rate']:.2%}")
-    print(f"  多單命中率      : {report['long_hit_rate']:.2%}")
-    print(f"  空單命中率      : {report['short_hit_rate']:.2%}")
-    print(f"  策略總回報      : {report['total_return']:.2%}")
-    print(f"  市場總回報      : {report['market_return']:.2%}")
-    print(f"  年化報酬(CAGR)  : {report['cagr']:.2%}")
-    print(f"  Sharpe          : {report['sharpe']:.3f}")
-    print(f"  Sortino         : {report['sortino']:.3f}")
-    print(f"  最大回撤        : {report['max_drawdown']:.2%}")
-    print(f"  Calmar          : {report['calmar']:.3f}")
-    print(f"  Profit Factor   : {report['profit_factor']:.3f}")
-    print(f"\n  Regime 分解:")
-    for regime, stats in regime_breakdown.items():
-        print(f"    {regime:8s}: 交易={stats['trades']:3d} | "
-              f"命中率={stats['hit_rate']:.2%} | "
-              f"均報酬={stats['avg_ret']:.4%}")
-    print("=" * 60)
-    print("✅ training.py: compute_backtest_report() 完成")
-
-    return report
