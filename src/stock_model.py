@@ -219,20 +219,81 @@ def fetch_southbound_holding(ticker: str) -> pd.DataFrame | None:
 #    用法反推：只寫入 intraday 衍生欄位，不動 close/volume/date/ret_1d
 #    （這些由呼叫端自行覆寫）。請核對此假設是否正確。
 # ============================================================
-def _update_last_row_with_intraday_stock(
-    last_row: pd.DataFrame, intra_dict: dict
-) -> pd.DataFrame:
-    last_row = last_row.copy()
-    for key in ["open", "high", "low"]:
-        if key in intra_dict:
-            last_row.at[0, key] = intra_dict[key]
-    for key in [
-        "intraday_ret", "intraday_range",
-        "high_vs_open", "low_vs_open", "ret_vs_prev",
-    ]:
-        if key in intra_dict:
-            last_row[key] = intra_dict[key]
-    return last_row
+def update_last_row_with_intraday(last_row: pd.DataFrame, intraday: dict) -> pd.DataFrame:
+    """
+    用日內數據更新 last_row 的特徵（原始 Colab Cell 3B 定義，逐字核對後確認，
+    HSI大盤與個股共用同一份邏輯）。
+    情境3專用：開市中，用即時數據提升預測準確度。
+    情境1專用：開市前，用 yfinance 1分鐘K線估算今日走勢（Cell 28 邏輯）。
+    """
+    row = last_row.copy()
+    if intraday is None:
+        return row
+
+    if intraday.get("open"):
+        row["open"] = intraday["open"]
+    if intraday.get("high"):
+        row["high"] = intraday["high"]
+    if intraday.get("low"):
+        row["low"] = intraday["low"]
+
+    if "intraday_ret" in intraday:
+        row["intraday_ret"] = intraday["intraday_ret"]
+    if "intraday_range" in intraday:
+        row["intraday_range"] = intraday["intraday_range"]
+    if "high_vs_open" in intraday:
+        row["high_vs_open"] = intraday["high_vs_open"]
+    if "low_vs_open" in intraday:
+        row["low_vs_open"] = intraday["low_vs_open"]
+    if "ret_vs_prev" in intraday:
+        row["ret_vs_prev_close"] = intraday["ret_vs_prev"]
+
+    if intraday.get("open") and intraday.get("prev_close"):
+        row["gap_ret"] = (intraday["open"] - intraday["prev_close"]) / intraday["prev_close"]
+
+    if (intraday.get("open") and intraday.get("high") and
+        intraday.get("low") and intraday.get("current")):
+        body  = abs(intraday["open"] - intraday["current"])
+        upper = intraday["high"] - max(intraday["open"], intraday["current"])
+        lower = min(intraday["open"], intraday["current"]) - intraday["low"]
+        if body > 0:
+            row["upper_wick"] = upper / body
+            row["lower_wick"] = lower / body
+        row["body_size"] = body / (intraday["open"] + 1e-9)
+
+    return row
+
+
+def _fetch_scenario1_intraday(ticker: str, prev_close: float) -> dict | None:
+    """
+    情境1專用（開市前）：用 yfinance 1分鐘K線估算「今日」價格走勢，
+    對應 Colab Cell 28 inline 邏輯逐字還原。
+    """
+    try:
+        tk_obj = yf.Ticker(ticker)
+        intra = tk_obj.history(period="1d", interval="1m")
+        if intra.empty:
+            return None
+
+        today_o = float(intra["Open"].iloc[0])
+        today_h = float(intra["High"].max())
+        today_l = float(intra["Low"].min())
+        today_c = float(intra["Close"].iloc[-1])
+        today_v = float(intra["Volume"].sum())
+
+        return {
+            "open": today_o, "high": today_h, "low": today_l,
+            "current": today_c, "prev_close": prev_close, "volume": today_v,
+            "intraday_ret": (today_c - prev_close) / prev_close,
+            "intraday_range": (today_h - today_l) / prev_close,
+            "high_vs_open": (today_h - today_o) / today_o,
+            "low_vs_open": (today_l - today_o) / today_o,
+            "ret_vs_prev": (today_c - prev_close) / prev_close,
+        }
+    except Exception as e:
+        print(f"  ⚠️  {ticker} 情境1盤前估算失敗: {e}")
+        return None
+
 
 
 # ============================================================
@@ -534,14 +595,10 @@ def daily_stock_update(
     stock_feat_cols_per: dict[str, list],
     hsi_direction: str,
     hsi_confidence: float,
+    scenario: int,
+    base_date_str: str,
     top_n: int = STOCK_TOP_N,
 ) -> pd.DataFrame:
-    """
-    產出個股排行榜（多/空排名），不涉及恆指大方向推論。
-
-    Returns:
-        DataFrame，欄位: ticker, name, sector, prob, signal, hsi_direction, hsi_confidence
-    """
     rows = []
     for ticker, df in stock_feat_data.items():
         if ticker not in stock_models or df is None or len(df) == 0:
@@ -551,7 +608,22 @@ def daily_stock_update(
         if not feat_cols:
             continue
 
-        last_row = df.iloc[[-1]].copy()
+        last_row = df.iloc[[-1]].copy().reset_index(drop=True)
+
+        # ── 情境1：開市前，用1分鐘K線估算今日走勢（Cell 28 邏輯）──
+        if scenario == 1:
+            lk_date_str = pd.Timestamp(last_row["date"].values[0]).strftime("%Y-%m-%d")
+            if lk_date_str < base_date_str:
+                prev_close = float(last_row["close"].values[0])
+                intra_dict = _fetch_scenario1_intraday(ticker, prev_close)
+                if intra_dict is not None:
+                    last_row = update_last_row_with_intraday(last_row, intra_dict)
+                    last_row.at[0, "close"]  = intra_dict["current"]
+                    last_row.at[0, "volume"] = intra_dict["volume"]
+                    last_row.at[0, "date"]   = pd.Timestamp(base_date_str)
+                    if prev_close > 0:
+                        last_row.at[0, "ret_1d"] = intra_dict["intraday_ret"]
+
         X = align_features(last_row[feat_cols], feat_cols)
         prob = _ensemble_predict_proba(stock_models[ticker], X)[0]
 
@@ -648,6 +720,8 @@ def run_stock_pipeline(df_all: pd.DataFrame, hsi_prediction: dict,
         stock_feat_data, stock_models, stock_feat_cols_per,
         hsi_direction=hsi_prediction["signal"],
         hsi_confidence=hsi_prediction["ensemble_prob"],
+        scenario=scenario,
+        base_date_str=today.strftime("%Y-%m-%d"),
     )
     return board
 
