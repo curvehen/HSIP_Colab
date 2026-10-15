@@ -243,7 +243,8 @@ def download_all_data() -> pd.DataFrame:
     for col, df in fred_dfs.items():
         if len(df) > 0:
             master = master.merge(df, on="date", how="left")
-            master[col] = master[col].fillna(method="ffill")
+            master[col] = master[col].ffill()
+
 
     print("\n[6/6] 清洗...")
     for col in ["sp500", "nasdaq", "csi300", "sse", "gold", "oil",
@@ -261,8 +262,9 @@ def download_all_data() -> pd.DataFrame:
 
     master = master.dropna(subset=["close"])
     num_cols = master.select_dtypes(include=[np.number]).columns
-    master[num_cols] = master[num_cols].fillna(method="ffill", limit=5)
+    master[num_cols] = master[num_cols].ffill(limit=5)
     master = master.reset_index(drop=True)
+
 
     return master
 
