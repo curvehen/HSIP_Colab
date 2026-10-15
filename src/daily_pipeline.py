@@ -90,9 +90,8 @@ def run_full_bootstrap() -> dict:
     df_all = build_features(df_all)
 
     state = run_initial_training(df_all)
-    state = run_daily_simulation(state)
-    state["last_backtest_report"] = compute_backtest_report(state)
-
+    sim_df = run_daily_simulation(state)          # run_daily_simulation 就地更新 state，並回傳 sim_df
+    state["last_backtest_report"] = compute_backtest_report(sim_df)
     return state
 
 
@@ -105,9 +104,8 @@ def run_incremental_update(state: dict) -> dict:
     df_all = build_features(df_all)
     state["df_all"] = df_all
 
-    state = run_daily_simulation(state)
-    state["last_backtest_report"] = compute_backtest_report(state)
-
+    sim_df = run_daily_simulation(state)
+    state["last_backtest_report"] = compute_backtest_report(sim_df)
     return state
 
 
