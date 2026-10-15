@@ -591,3 +591,19 @@ print(f"  {scenario_icons.get(CTX['scenario'], '❓')} "
       f"情境 {CTX['scenario']}：{CTX['scenario_desc']}")
 print("=" * 60)
 print("✅ config.py (Cell 1+2+2B) 載入完成")
+
+
+
+# ── Adaptive component constants [RECONSTRUCTED] ───────────
+PROB_LONG                = 0.58
+PROB_SHORT               = 0.42
+KELLY_FRACTION           = 0.5     # half-Kelly
+MAX_POSITION             = 1.0
+MIN_POSITION             = 0.0
+CALIBRATION_MIN_SAMPLES  = 30
+
+from src.adaptive import ThresholdCalibrator, PositionSizer, EnsembleWeighter
+
+threshold_calibrator = ThresholdCalibrator()
+position_sizer        = PositionSizer()
+ensemble_weighter     = EnsembleWeighter()
