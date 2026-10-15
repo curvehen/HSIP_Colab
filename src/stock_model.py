@@ -4,15 +4,24 @@ src/stock_model.py
 個股預測模組（對應 Colab HSI_Colab.py Cell 20b/21/22/23/26/28）。
 
 設計原則（與 hl_model.py 一致）：
-  - 所有函式只接收明確參數，不碰觸 state dict。
-  - state 的組裝/拆解交由 daily_pipeline.py 負責（本檔案目前尚未接入）。
+  - 核心函式只接收明確參數，不碰觸 pipeline_state.pkl。
+  - 個股模型（stock_models/stock_feat_cols_per）與重訓日期（meta）
+    皆獨立存放於 models/stocks/，不列入 config.STATE_KEYS（決策1）。
   - 僅實作「個股獨立模型」路徑（每股一個 LightGBM），
     Colab Cell 25 的 Panel 共用模型路徑依共識捨棄不迁移。
+  - 重訓週期：每 7 天（一週）重新訓練全部個股模型（決策2）。
+  - 排行榜（board）會被 daily_pipeline.py 存成 CSV，
+    供 send_report.py 讀取並放入郵件（決策3）。
 
-已知待確認事項：
+已知待確認/妥協事項：
   - _update_last_row_with_intraday_stock() 標註 [RECONSTRUCTED]，
     因原始 update_last_row_with_intraday() 定義在 Colab 中找不到，
     此處依呼叫端用法反推實作，請核對後移除此警語。
+  - _FLOW_COLS 改用南向資金持股變化，而非原 Colab 的主力/超大單/
+    大單/散戶資金流拆分（AkShare 無法穩定提供港股個股此類數據，
+    評估結論：選項1）。
+  - _train_lgbm_seeded() 複製 models.train_lgbm() 邏輯並擴充 seed
+    參數，不修改共用檔案 models.py（方案B，降低對既有流程的風險）。
 """
 
 import os
@@ -22,20 +31,23 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import joblib
+import lightgbm as lgb
 
 from ta.momentum   import RSIIndicator
 from ta.trend      import MACD
 from ta.volatility import BollingerBands, AverageTrueRange
 
 from sklearn.metrics import accuracy_score, roc_auc_score
+from sklearn.calibration import CalibratedClassifierCV
 
 from src import config as cfg
-from src.models import train_lgbm, align_features, safe_predict
-from sklearn.calibration import CalibratedClassifierCV
-import lightgbm as lgb
+from src.models import align_features, safe_predict
+# 注意：不 import train_lgbm，改用下方 _train_lgbm_seeded()。
+#       原因：train_lgbm() 不支援自訂 random_state，為避免修改共用
+#       檔案 models.py（會影響 training.py / hl_model.py 的既有呼叫
+#       路徑），在本檔案內複製一份邏輯並擴充 seed 參數。
 
 
-  
 # ============================================================
 # 常數：直接複用 config.py 既有定義，不重複定義
 # ============================================================
@@ -57,12 +69,15 @@ _FLOW_COLS = [
     "southbound_hold_pct",
 ]
 
-
 _EXCLUDE_COLS = {
     "date", "target", "next_ret",
     "open", "high", "low", "close", "volume",
     "ticker", "name",
 }
+
+# 個股模型持久化路徑（決策1：不進 pipeline_state.pkl）
+_STOCK_MODEL_DIR = os.path.join("models", "stocks")
+_META_PATH = os.path.join(_STOCK_MODEL_DIR, "_meta.pkl")
 
 
 # ============================================================
@@ -162,6 +177,7 @@ def download_stock(
     df["sector"] = SECTOR_MAP.get(ticker, "其他")
     return df
 
+
 # ============================================================
 # 1b. 南向資金持股數據（取代原 _FLOW_COLS 的主力/大單拆分，
 #     因 AkShare 無法穩定提供港股個股的主力資金流拆分）
@@ -195,6 +211,7 @@ def fetch_southbound_holding(ticker: str) -> pd.DataFrame | None:
     df["southbound_hold_chg_5d"] = df["hold_shares"].diff(5)
 
     return df[["date", "southbound_hold_chg_1d", "southbound_hold_chg_5d", "southbound_hold_pct"]]
+
 
 # ============================================================
 # 2. [RECONSTRUCTED] 情境1盤中補數據（單行 DataFrame 版）
@@ -313,7 +330,6 @@ def build_stock_features(
         df["rel_strength_20"] = np.nan
         df["beta_60"] = np.nan
 
-    # ── 資金流欄位（若上游已合併 Stock Connect flow 資料則保留，否則補 NaN）──
     # ── 資金流欄位：南向資金持股變化（若呼叫端已合併則保留，否則補 NaN）──
     # 呼叫端應先呼叫 fetch_southbound_holding() 並 merge 到 df 再傳入本函式，
     # 本函式僅做欄位存在性保護，不主動下載（避免重複網路請求）。
@@ -360,9 +376,10 @@ def _ensemble_predict_proba(models: list, X: pd.DataFrame) -> np.ndarray:
         return np.full(len(X), 0.5)
     return np.mean(probs, axis=0)
 
+
 # ============================================================
 # 5b. 自訂 seed 版 LightGBM 訓練（複製 models.train_lgbm() 邏輯，
-#     不修改共用檔案，僅本模組使用）
+#     不修改共用檔案，僅本模組使用 — 方案B）
 # ============================================================
 def _train_lgbm_seeded(X_tr, y_tr, X_val, y_val, seed: int):
     """
@@ -385,6 +402,7 @@ def _train_lgbm_seeded(X_tr, y_tr, X_val, y_val, seed: int):
         print(f"    ⚠️  seed={seed} 訓練失敗: {e}")
         return None
 
+
 # ============================================================
 # 6. 個股獨立模型訓練（Cell 22/23 對應，每股一個模型）
 # ============================================================
@@ -393,7 +411,7 @@ def train_stock_models(
     n_seeds: int = 3,
 ) -> tuple[dict, dict, dict]:
     """
-    對 stock_feat_data 中每檔股票各自訓練一個（或多 seed 集成）LightGBM 分類模型。
+    對 stock_feat_data 中每檔股票各自訓練一個（多 seed 集成）LightGBM 分類模型。
 
     Returns:
         stock_models        : {ticker: [model_seed1, model_seed2, ...]}
@@ -433,12 +451,9 @@ def train_stock_models(
                 print(f"  ❌ {ticker}: 全部 seed 訓練失敗")
                 continue
 
-            val_X = X_val
-            val_y = y_val
-            val_prob = _ensemble_predict_proba(seed_models, val_X)
-
-            auc = roc_auc_score(val_y, val_prob) if val_y.nunique() > 1 else float("nan")
-            acc = accuracy_score(val_y, (val_prob > 0.5).astype(int))
+            val_prob = _ensemble_predict_proba(seed_models, X_val)
+            auc = roc_auc_score(y_val, val_prob) if y_val.nunique() > 1 else float("nan")
+            acc = accuracy_score(y_val, (val_prob > 0.5).astype(int))
 
             stock_models[ticker] = seed_models
             stock_feat_cols_per[ticker] = feat_cols
@@ -460,7 +475,7 @@ def train_stock_models(
 # ============================================================
 def save_stock_models(
     stock_models: dict, stock_feat_cols_per: dict,
-    out_dir: str = os.path.join("models", "stocks"),
+    out_dir: str = _STOCK_MODEL_DIR,
 ) -> None:
     os.makedirs(out_dir, exist_ok=True)
     saved = 0
@@ -476,7 +491,7 @@ def save_stock_models(
 
 
 def load_stock_models(
-    tickers: list[str], in_dir: str = os.path.join("models", "stocks"),
+    tickers: list[str], in_dir: str = _STOCK_MODEL_DIR,
 ) -> tuple[dict, dict]:
     stock_models: dict[str, list] = {}
     stock_feat_cols_per: dict[str, list] = {}
@@ -494,10 +509,24 @@ def load_stock_models(
 
 
 # ============================================================
+# 7b. 重訓日期中繼資料（獨立於 pipeline_state.pkl，決策1）
+# ============================================================
+def load_stock_meta() -> dict:
+    if os.path.exists(_META_PATH):
+        return joblib.load(_META_PATH)
+    return {"last_retrain_date": None}
+
+
+def save_stock_meta(meta: dict) -> None:
+    os.makedirs(os.path.dirname(_META_PATH), exist_ok=True)
+    joblib.dump(meta, _META_PATH)
+
+
+# ============================================================
 # 8. 每日個股更新 — 只保留排行榜部分
 #    恆指大方向（hsi_direction / hsi_confidence）由呼叫端
-#    （daily_pipeline.py）算好傳入，此函式不重複推論
-#    global_model / regime_models（依共識，問題3）。
+#    （daily_pipeline.py / run_stock_pipeline）算好傳入，
+#    此函式不重複推論 global_model / regime_models（依共識，問題3）。
 # ============================================================
 def daily_stock_update(
     stock_feat_data: dict[str, pd.DataFrame],
@@ -509,14 +538,6 @@ def daily_stock_update(
 ) -> pd.DataFrame:
     """
     產出個股排行榜（多/空排名），不涉及恆指大方向推論。
-
-    Args:
-        stock_feat_data      : {ticker: df_with_features}，每檔股票已含最新一行特徵
-        stock_models         : {ticker: [model_seed1, ...]}
-        stock_feat_cols_per   : {ticker: [feat_col, ...]}
-        hsi_direction        : 由 daily_pipeline.py 算好的恆指方向 ("bull"/"bear"/"neutral")
-        hsi_confidence       : 由 daily_pipeline.py 算好的恆指信心值
-        top_n                : 排行榜取前 N 檔
 
     Returns:
         DataFrame，欄位: ticker, name, sector, prob, signal, hsi_direction, hsi_confidence
@@ -560,3 +581,73 @@ def daily_stock_update(
     print(board.tail(top_n).sort_values("prob")[["ticker", "name", "prob", "signal"]].to_string(index=False))
 
     return board
+
+
+# ============================================================
+# 9. 頂層協調函式 — 由 daily_pipeline.py 呼叫
+#    負責：下載 → 合併南向資金 → 特徵工程 → 判斷是否重訓
+#         → 訓練/載入模型 → 產出排行榜
+# ============================================================
+def run_stock_pipeline(df_all: pd.DataFrame, hsi_prediction: dict,
+                        retrain_days: int = 7) -> pd.DataFrame:
+    """
+    個股預測主流程，由 daily_pipeline.py 呼叫。
+
+    Args:
+        df_all         : HSI 恆指完整歷史 DataFrame（用於計算個股相對強弱/beta）
+        hsi_prediction : predict_next_day() 的回傳 dict，需含 "signal"/"ensemble_prob"
+        retrain_days   : 重訓週期天數（預設7天=每週，決策2）
+
+    Returns:
+        board: DataFrame，個股排行榜（可能為空 DataFrame，不會拋例外中斷主流程由呼叫端處理）
+    """
+    ctx = cfg.get_prediction_context()
+    today = ctx["now_hkt"].date()
+    scenario = ctx["scenario"]
+    download_end = (today + pd.Timedelta(days=2)).strftime("%Y-%m-%d")
+
+    # 1) 下載 + 合併南向資金 + 特徵工程
+    stock_feat_data = {}
+    for ticker, name in STOCK_LIST.items():
+        df = download_stock(ticker, name, download_end, scenario, today)
+        if df is None:
+            continue
+        flow = fetch_southbound_holding(ticker)
+        if flow is not None:
+            df = df.merge(flow, on="date", how="left")
+        stock_feat_data[ticker] = build_stock_features(df, df_all, ticker)
+
+    tickers = list(stock_feat_data.keys())
+    if not tickers:
+        print("  ⚠️  所有個股下載均失敗，跳過本次個股預測")
+        return pd.DataFrame(columns=[
+            "ticker", "name", "sector", "prob", "signal",
+            "hsi_direction", "hsi_confidence",
+        ])
+
+    # 2) 判斷是否需要重訓（每週一次，獨立 meta 檔案判斷，決策1+2）
+    meta = load_stock_meta()
+    last_retrain_date = meta.get("last_retrain_date")
+    need_retrain = last_retrain_date is None or (
+        (today - pd.Timestamp(last_retrain_date).date()).days >= retrain_days
+    )
+
+    if need_retrain:
+        print(f"  🔄 個股模型重訓觸發（距上次: "
+              f"{'從未訓練' if last_retrain_date is None else f'{(today - pd.Timestamp(last_retrain_date).date()).days}天'}）")
+        stock_models, stock_feat_cols_per, _ = train_stock_models(stock_feat_data)
+        save_stock_models(stock_models, stock_feat_cols_per)
+        save_stock_meta({"last_retrain_date": today.strftime("%Y-%m-%d")})
+    else:
+        stock_models, stock_feat_cols_per = load_stock_models(tickers)
+        print(f"  ℹ️  個股模型沿用舊版（距上次訓練 "
+              f"{(today - pd.Timestamp(last_retrain_date).date()).days}天，未滿{retrain_days}天）")
+
+    # 3) 預測排行榜
+    board = daily_stock_update(
+        stock_feat_data, stock_models, stock_feat_cols_per,
+        hsi_direction=hsi_prediction["signal"],
+        hsi_confidence=hsi_prediction["ensemble_prob"],
+    )
+    return board
+
