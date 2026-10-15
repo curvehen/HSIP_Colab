@@ -2,7 +2,7 @@ name: HSI Daily Prediction Pipeline
 
 on:
   schedule:
-    - cron: '0 1 * * 1-5'   # 09:00 HKT, Mon-Fri (UTC 01:00)
+    - cron: '45 8 * * 1-5'   # 16:45 HKT, Mon-Fri (UTC 08:45)
   workflow_dispatch:         # allow manual trigger
 
 jobs:
