@@ -198,14 +198,11 @@ def main():
 
         prediction = predict_next_day(state)
 
-        try:
-            from src.email_report import send_email
-            send_email(prediction, state.get("last_backtest_report", {}))
-        except Exception as e:
-            print(f"  ⚠️  email 發送失敗（pipeline 仍視為成功）: {e}")
+        print("  ℹ️  Email 將在 charts 生成後，由獨立 workflow step 發送")
 
         print("\n✅ daily_pipeline.py 執行完成")
         return 0
+
 
     except Exception as e:
         print(f"\n❌ Pipeline 執行失敗: {e}")
