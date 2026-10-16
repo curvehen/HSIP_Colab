@@ -461,10 +461,11 @@ def run_daily_simulation(state: dict) -> pd.DataFrame:
     print(f"\n  ✅ 模擬完成，共 {len(sim_df)} 筆記錄")
 
     # ── 更新 state（就地寫回最新模型引用）──────────────────
-    state["global_model"]  = global_model
-    state["regime_models"] = regime_models
-    state["hmm"]           = hmm
-    state["df_sim_result"] = sim_df
+    state["global_model"]   = global_model
+    state["regime_models"]  = regime_models
+    state["hmm"]            = hmm
+    state["df_sim_result"]  = sim_df
+    state["last_roll_acc"]  = roll_acc   # 供 predict_next_day() 計算倉位時使用
 
     return sim_df
 
