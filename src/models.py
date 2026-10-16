@@ -162,15 +162,17 @@ def train_lgbm(X_tr, y_tr, X_val, y_val):
         callbacks = [lgb.early_stopping(40, verbose=False),
                      lgb.log_evaluation(period=-1)]
     )
-    # cv="prefit" 已在新版 scikit-learn（1.6+）移除，改用 FrozenEstimator
-    # 包裝已訓練模型，效果與原本的 "prefit" 模式等價（不重新訓練，只做校準）。
+    # [修正過擬合] isotonic校準在小樣本驗證集（<1000筆，本專案通常
+    # 僅數百筆）容易產生階梯狀極端值（0.99+/0.01-），這是scikit-learn
+    # 官方文件明確記載的已知限制。改用sigmoid（Platt scaling），
+    # 為參數化平滑函數，小樣本下更穩健，不易產生過度自信的極端機率。
     if _HAS_FROZEN_ESTIMATOR:
-        cal = CalibratedClassifierCV(FrozenEstimator(model), method="isotonic")
+        cal = CalibratedClassifierCV(FrozenEstimator(model), method="sigmoid")
     else:
-        # 相容舊版 scikit-learn（<1.6）環境的備援寫法
-        cal = CalibratedClassifierCV(model, method="isotonic", cv="prefit")
+        cal = CalibratedClassifierCV(model, method="sigmoid", cv="prefit")
     cal.fit(X_val, y_val)
     return cal
+
 
 
 
