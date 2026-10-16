@@ -15,11 +15,11 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     df    = df.copy().sort_values("date").reset_index(drop=True)
     close = df["close"]
 
-    # ── 目標變數 ────────────────────────────────────────────
+    # ── 目標變數 ────────────────────────────────────────
     df["next_ret"] = close.pct_change().shift(-1)
     df["target"]   = (df["next_ret"] > 0).astype(int)
 
-    # ── 價格動能 ─────────────────────────────────────────────
+    # ── 價格動能 ────────────────────────────────────────
     for w in [1,2,3,5,10,20,60]:
         df[f"ret_{w}d"] = close.pct_change(w)
 
@@ -41,13 +41,13 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     df["ma5_20"]  = (close.rolling(5).mean()  > close.rolling(20).mean()).astype(int)
     df["ma20_60"] = (close.rolling(20).mean() > close.rolling(60).mean()).astype(int)
 
-    # ── 成交量 ───────────────────────────────────────────────
+    # ── 成交量 ────────────────────────────────────────
     if "volume" in df.columns:
         vol = df["volume"]
         for w in [5,10,20]:
             df[f"vol_surge_{w}"] = vol / (vol.rolling(w).mean() + 1e-9)
 
-    # ── 技術指標 ─────────────────────────────────────────────
+    # ── 技術指標 ────────────────────────────────────────
     df["rsi_6"]       = RSIIndicator(close, window=6).rsi()
     df["rsi_14"]      = RSIIndicator(close, window=14).rsi()
     macd_obj          = MACD(close)
@@ -71,7 +71,7 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     df["high_vol"]  = (df["vol_20"] > df["vol_60"]).astype(int)
     df["trend_up"]  = (close.rolling(20).mean() > close.rolling(60).mean()).astype(int)
 
-    # ── 外圍特徵 ─────────────────────────────────────────────
+    # ── 外圍特徵 ────────────────────────────────────────
     for col in ["sp500","nasdaq","csi300","sse","gold","oil",
                 "vix","us10y","dxy","usdcny","tencent"]:
         rc = f"{col}_ret"
@@ -92,7 +92,7 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     if "dxy" in df.columns:
         df["dxy_chg"] = df["dxy"].pct_change().shift(1)
 
-    # ── 北向資金特徵 ─────────────────────────────────────────
+    # ── 北向資金特徵 ────────────────────────────────────────
     for col in ["northbound_flow","nb_ma5","nb_ma20","nb_zscore",
                 "nb_inflow","nb_cum5"]:
         if col in df.columns:
@@ -102,13 +102,13 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
         nb = df["northbound_flow"]
         df["nb_diverge"] = ((nb.shift(1) > 0) & (ret.shift(1) < 0)).astype(int)
 
-    # ── 跨市場特徵 ───────────────────────────────────────────
+    # ── 跨市場特徵 ────────────────────────────────────────
     if "sp500_ret"  in df.columns:
         df["hsi_sp500_spread"] = ret.shift(1) - df["sp500_ret"].shift(1)
     if "csi300_ret" in df.columns:
         df["hsi_csi_spread"]   = ret.shift(1) - df["csi300_ret"].shift(1)
 
-    # ── 日曆特徵 ─────────────────────────────────────────────
+    # ── 日曆特徵 ────────────────────────────────────────
     d = df["date"]
     df["dow"]            = d.dt.dayofweek
     df["month"]          = d.dt.month
@@ -120,10 +120,11 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     df["dow_sin"]        = np.sin(2 * np.pi * df["dow"] / 5)
     df["dow_cos"]        = np.cos(2 * np.pi * df["dow"] / 5)
 
-    # 僅過濾技術指標暖機期的 NaN（開頭 ~26 行），
-    # 不過濾 target/next_ret —— 這兩者對「最新一行」(尚無明日數據)
+    # 僅過濾技術指標暖機期的 NaN（開頭約26行），
+    # 不再過濾 target/next_ret —— 這兩者對「最新一行」(尚無明日數據)
     # 必然是 NaN，但該行正是預測所需的最新資料，不應在此被丟棄。
-    # target 為 NaN 的過濾責任交給 training.py 的訓練/模擬流程自行處理。
+    # target 為 NaN 的過濾責任交由 training.py 的訓練/模擬流程自行處理
+    # （df_train / df_sim 切分後各自明確 dropna(subset=["target"])）。
     df = df.dropna(subset=["rsi_14","macd","bb_pos"])
     df = df.reset_index(drop=True)
     return df
