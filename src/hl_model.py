@@ -188,18 +188,15 @@ def get_hl_feat_cols(df_hl: pd.DataFrame, classifier_feat_cols: list) -> tuple:
 # [RECONSTRUCTED — see module docstring above]
 # ============================================================
 def train_hl_model(train_df: pd.DataFrame, target_col: str, hl_feat_cols: list):
-    """
-    Confirmed verbatim up to the train/val split. The fit/evaluate
-    logic below is reconstructed from the LGBM_REG_PARAMS already
-    defined in your source and the train_model_fixed() pattern in
-    Cell 5 — NOT copied from a verbatim source line, since that
-    section was missing from what was provided.
-
-    Returns: (fitted_model, mae, r2) to match the 3-value return
-    signature implied by `return None, 999.0, -999.0` in your
-    original early-exit line.
-    """
     from sklearn.metrics import mean_absolute_error, r2_score
+
+    # ── 過濾目標變數 NaN ─────────────────────────────────────
+    # 原因：data_loader.py 的清洗僅保證 close 非空
+    # （master.dropna(subset=["close"])），open/high/low 偶發的
+    # 零星缺值會透過 build_hl_targets() 的 shift(-1) 滲透進目標欄位。
+    # align_features() 只處理特徵 X 的 NaN（fillna 0.0），
+    # 不會處理目標 y，必須在此單獨過濾。
+    train_df = train_df.dropna(subset=[target_col]).reset_index(drop=True)
 
     if len(train_df) < 120:
         return None, 999.0, -999.0
@@ -218,7 +215,6 @@ def train_hl_model(train_df: pd.DataFrame, target_col: str, hl_feat_cols: list):
             callbacks = [lgb.early_stopping(40, verbose=False),
                          lgb.log_evaluation(period=-1)]
         )
-
         pred = model.predict(X_val)
         mae  = mean_absolute_error(y_val, pred)
         r2   = r2_score(y_val, pred)
@@ -226,6 +222,7 @@ def train_hl_model(train_df: pd.DataFrame, target_col: str, hl_feat_cols: list):
     except Exception as e:
         print(f"    ⚠️  HL訓練失敗 ({target_col}): {e}")
         return None, 999.0, -999.0
+
 
 
 
