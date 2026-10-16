@@ -150,30 +150,45 @@ def run_incremental_update(state: dict) -> dict:
 
 
 def predict_next_day(state: dict) -> dict:
+    """
+    對最新一行數據產生明日預測。
+    對齊 training.py 的 run_daily_simulation() 實際使用的介面：
+      - HMMRegime 沒有單行 predict 方法，regime 需透過 add_features()
+        對整個 df 計算後，取最後一行的 hmm_regime 欄位。
+      - ensemble_weighter.ensemble(g_prob, r_prob) 不吃 regime 參數。
+      - threshold_calibrator.get_signal(prob, regime) 直接回傳 -1/0/1，
+        不需要自己比較 threshold。
+      - position_sizer.compute_size(prob, signal, regime, roll_acc) 需要
+        signal 與 roll_acc；首次預測無歷史 roll_acc，用 0.5 中性值。
+    """
     df_all     = state["df_all"]
     feat_cols  = state["feat_cols"]
     hmm        = state["hmm"]
     global_m   = state["global_model"]
     regime_ms  = state["regime_models"]
 
-    last_row = df_all.iloc[[-1]].copy()
-    regime   = hmm.predict_regime(last_row) if hasattr(hmm, "predict_regime") else "neutral"
+    if "hmm_regime" not in df_all.columns:
+        df_all = hmm.add_features(df_all)
 
-    # safe_predict() 需要 3 個參數 (model, df, feat_cols)，且回傳單一 float（非陣列），
-    # 不需要 [0] 索引。對齊 models.py 的真實簽名。
+    last_row = df_all.iloc[[-1]].copy()
+    regime   = str(last_row["hmm_regime"].values[0]) if "hmm_regime" in last_row.columns else "neutral"
+
     global_prob = safe_predict(global_m, last_row, feat_cols)
     regime_prob = (
         safe_predict(regime_ms[regime], last_row, feat_cols)
         if regime in regime_ms else global_prob
     )
 
+    ensemble_prob = config.ensemble_weighter.ensemble(global_prob, regime_prob)
 
-    ensemble_prob = config.ensemble_weighter.blend(global_prob, regime_prob, regime)
-    threshold = config.threshold_calibrator.get_threshold(regime)
-    signal = "LONG" if ensemble_prob > threshold else (
-        "SHORT" if ensemble_prob < (1 - threshold) else "NEUTRAL"
+    signal_code = config.threshold_calibrator.get_signal(ensemble_prob, regime)
+    signal = {1: "LONG", -1: "SHORT", 0: "NEUTRAL"}.get(signal_code, "NEUTRAL")
+
+    # 首次執行無歷史 roll_acc 可用，沿用 run_daily_simulation() 的初始化慣例（0.5）
+    roll_acc = state.get("last_roll_acc", 0.5)
+    position_size = config.position_sizer.compute_size(
+        prob=ensemble_prob, signal=signal_code, regime=regime, roll_acc=roll_acc,
     )
-    position_size = config.position_sizer.get_size(ensemble_prob, regime)
 
     prediction = {
         "as_of_date": pd.Timestamp(last_row["date"].values[0]).strftime("%Y-%m-%d"),
@@ -190,6 +205,7 @@ def predict_next_day(state: dict) -> dict:
     print(f"  ✅ 預測已儲存: {prediction}")
 
     return prediction
+
 
 
 # ============================================================
