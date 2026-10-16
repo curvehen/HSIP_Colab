@@ -26,20 +26,12 @@ from src.config import (
 # ThresholdCalibrator — per-regime dynamic probability thresholds
 # ============================================================
 class ThresholdCalibrator:
-    """
-    Searches a grid of candidate long/short probability thresholds
-    per HMM regime, picking the pair that maximizes realized hit-rate
-    on recent history while keeping a minimum trade frequency (to
-    avoid collapsing to "never trade" as a degenerate optimum).
-
-    Falls back to static PROB_LONG / PROB_SHORT (from config) for any
-    regime that hasn't been calibrated yet or has too few samples.
-    """
-
-    def __init__(self, grid_step: float = 0.02, min_trades: int = 10):
+    def __init__(self, grid_step: float = 0.02, min_trades: int = 40,
+                 smoothing_alpha: float = 0.4):
         self.grid_step = grid_step
         self.min_trades = min_trades
-        self.regime_thresholds: dict = {}   # {regime: {"long": x, "short": y}}
+        self.smoothing_alpha = smoothing_alpha   # 新門檻權重;越小越平滑
+        self.regime_thresholds: dict = {}
         self.calibration_log: list = []
 
     def calibrate(self, df, prob_col: str, target_col: str, regime_col: str):
@@ -84,12 +76,24 @@ class ThresholdCalibrator:
                         best_long  = float(lt)
                         best_short = float(st)
 
+            # --- 門檻平滑:新舊加權平均,而非直接覆蓋 ---
+            prev = self.regime_thresholds.get(regime)
+            if prev is not None:
+                a = self.smoothing_alpha
+                smoothed_long  = a * best_long  + (1 - a) * prev["long"]
+                smoothed_short = a * best_short + (1 - a) * prev["short"]
+            else:
+                # 該 regime 首次校準,沒有舊值可平滑,直接採用
+                smoothed_long, smoothed_short = best_long, best_short
+
             self.regime_thresholds[regime] = {
-                "long": best_long, "short": best_short, "score": best_score,
+                "long": smoothed_long, "short": smoothed_short, "score": best_score,
             }
             self.calibration_log.append({
-                "regime": regime, "long": best_long,
-                "short": best_short, "score": round(best_score, 4),
+                "regime": regime,
+                "raw_long": best_long, "raw_short": best_short,
+                "long": round(smoothed_long, 4), "short": round(smoothed_short, 4),
+                "score": round(best_score, 4),
             })
 
     def get_signal(self, prob: float, regime: str) -> int:
@@ -101,6 +105,7 @@ class ThresholdCalibrator:
         elif prob <= th["short"]:
             return -1
         return 0
+
 
 
 # ============================================================
