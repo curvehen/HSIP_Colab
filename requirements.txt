@@ -2,7 +2,7 @@ yfinance
 akshare
 lightgbm
 hmmlearn
-scikit-learn
+scikit-learn>=1.6
 torch
 ta
 pandas_datareader
