@@ -67,8 +67,9 @@ def run_initial_training(df_all: pd.DataFrame) -> dict:
     hmm = HMMRegime(n_states=3)
     hmm.fit(df_train)
     df_all   = hmm.add_features(df_all)
-    df_train = df_all[train_mask].copy().dropna(subset=["target"]).reset_index(drop=True)
-    df_sim   = df_all[sim_mask].copy().dropna(subset=["target"]).reset_index(drop=True)
+    df_train = df_all[train_mask].copy().dropna(subset=["target", "next_ret"]).reset_index(drop=True)
+    df_sim   = df_all[sim_mask].copy().dropna(subset=["target", "next_ret"]).reset_index(drop=True)
+
 
     print(f"  Regime 分布（訓練集）:")
     print(df_train["hmm_regime"].value_counts().to_string())
@@ -290,7 +291,8 @@ def run_daily_simulation(state: dict) -> pd.DataFrame:
 
     sim_mask = df_all["date"] >= SIM_START
     df_sim   = df_all[sim_mask].copy()
-    df_sim   = df_sim.dropna(subset=["target"]).reset_index(drop=True)
+    df_sim   = df_sim.dropna(subset=["target", "next_ret"]).reset_index(drop=True)
+
     sim_records: list = []
 
 
