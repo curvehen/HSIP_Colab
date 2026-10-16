@@ -43,8 +43,12 @@ def run_initial_training(df_all: pd.DataFrame) -> dict:
         (df_all["date"] >= pd.Timestamp(TRAIN_START)) &
         (df_all["date"] <= pd.Timestamp(TRAIN_END))
     )
-    df_train = df_all[train_mask].copy().reset_index(drop=True)
+    df_train = df_all[train_mask].copy()
+    # 防呆：若 TRAIN_END 恰好設為接近今天的日期，最後一行 target 可能為
+    # NaN，訓練時需明確排除（正常情況下 TRAIN_END 是歷史日期，此行通常無影響）
+    df_train = df_train.dropna(subset=["target"]).reset_index(drop=True)
     print(f"  訓練集行數 : {len(df_train)} rows ({TRAIN_START} → {TRAIN_END})")
+
 
     sim_mask = df_all["date"] >= SIM_START
     df_sim   = df_all[sim_mask].copy()
@@ -63,8 +67,8 @@ def run_initial_training(df_all: pd.DataFrame) -> dict:
     hmm = HMMRegime(n_states=3)
     hmm.fit(df_train)
     df_all   = hmm.add_features(df_all)
-    df_train = df_all[train_mask].copy().reset_index(drop=True)
-    df_sim   = df_all[sim_mask].copy().reset_index(drop=True)
+    df_train = df_all[train_mask].copy().dropna(subset=["target"]).reset_index(drop=True)
+    df_sim   = df_all[sim_mask].copy().dropna(subset=["target"]).reset_index(drop=True)
 
     print(f"  Regime 分布（訓練集）:")
     print(df_train["hmm_regime"].value_counts().to_string())
@@ -285,8 +289,10 @@ def run_daily_simulation(state: dict) -> pd.DataFrame:
     print(f"  TRAIN_WINDOW = {TRAIN_WINDOW} days")
 
     sim_mask = df_all["date"] >= SIM_START
-    df_sim   = df_all[sim_mask].copy().reset_index(drop=True)
+    df_sim   = df_all[sim_mask].copy()
+    df_sim   = df_sim.dropna(subset=["target"]).reset_index(drop=True)
     sim_records: list = []
+
 
     roll_acc           = 0.5
     roll_auc           = 0.5
