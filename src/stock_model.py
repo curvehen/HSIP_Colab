@@ -430,18 +430,19 @@ def get_stock_feat_cols(df: pd.DataFrame) -> list[str]:
 # ============================================================
 # 5. 多種子集成預測（輔助函式）
 # ============================================================
-def _ensemble_predict_proba(models: list, X: pd.DataFrame) -> np.ndarray:
+def _ensemble_predict_proba(models: list, X: pd.DataFrame, feat_cols: list) -> np.ndarray:
     """對同一檔股票的多個 seed 模型取平均機率。"""
     if not models:
-        return np.full(len(X), 0.5)
+        return np.full(1, 0.5)
     probs = []
     for m in models:
-        p = safe_predict(m, X)
+        p = safe_predict(m, X, feat_cols)
         if p is not None:
             probs.append(p)
     if not probs:
-        return np.full(len(X), 0.5)
-    return np.mean(probs, axis=0)
+        return np.full(1, 0.5)
+    return np.array([np.mean(probs)])
+
 
 
 # ============================================================
