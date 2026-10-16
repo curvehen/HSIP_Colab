@@ -93,6 +93,14 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
         df["dxy_chg"] = df["dxy"].pct_change().shift(1)
 
     # ── 北向資金特徵 ────────────────────────────────────────
+    # [移除] 滬深港交所已於 2024-08-19 起取消北向資金每日淨買賣
+    # 金額披露（監管政策調整，非數據源故障），northbound_flow 欄位
+    # 自該日起已無真實數據（後續值為 ffill 延伸的過期假數值）。
+    # 經查證確認為不可逆的政策性數據斷層，不另尋替代指標
+    # （詳見專案討論：AH溢價需自建歷史序列，開發成本與引入新
+    # 資料品質風險不划算；南向資金 southbound_flow 持續更新，
+    # 已可作為資金流代理指標，保留使用）。
+    '''
     for col in ["northbound_flow","nb_ma5","nb_ma20","nb_zscore",
                 "nb_inflow","nb_cum5"]:
         if col in df.columns:
@@ -101,7 +109,7 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     if "northbound_flow" in df.columns:
         nb = df["northbound_flow"]
         df["nb_diverge"] = ((nb.shift(1) > 0) & (ret.shift(1) < 0)).astype(int)
-
+    '''
     # ── 跨市場特徵 ────────────────────────────────────────
     if "sp500_ret"  in df.columns:
         df["hsi_sp500_spread"] = ret.shift(1) - df["sp500_ret"].shift(1)
