@@ -69,9 +69,12 @@ STOCK_TOP_N       = cfg.STOCK_TOP_N
 # 依賴 AkShare 的 stock_individual_fund_flow()，該介面主要支援A股，
 # 對港股支援度不穩定，故改用南向資金持股變化作為替代資金流特徵
 # （評估結論：選項1，資料真實可取得，但欄位結構與原版不同）。
+# _FLOW_COLS 保留作為「完整候選清單」的文件記錄用途，
+# 實際以 merge 後 df 中真正存在的欄位為準（見下方 build_stock_features）
 _FLOW_COLS = [
     "southbound_hold_chg_1d",
     "southbound_hold_chg_5d",
+    "southbound_hold_pct",   # 目前AkShare版本通常不存在，自動以NaN補上
 ]
 
 _EXCLUDE_COLS = {
@@ -191,10 +194,12 @@ def download_stock(
 def fetch_southbound_holding(ticker: str) -> pd.DataFrame | None:
     """
     取得單一港股的南向資金（港股通）每日持股變化。
-    [修正] stock_hsgt_individual_em() 實際並無「持股數量佔流通股比」
-    欄位（已查證），原欄位名稱為臆測、不存在。改為只保留可直接取得
-    的持股量增減特徵，不計算佔比（避免額外呼叫流通股本接口增加
-    複雜度與失敗點）。
+
+    [彈性設計] AkShare stock_hsgt_individual_em() 的實際回傳欄位
+    可能因版本/接口調整而變動（已查證目前版本無「持股數量佔流通
+    股比」欄位）。本函式動態偵測哪些目標欄位真正存在，只處理存在
+    的欄位；缺失的欄位自動跳過，不會因此報錯或中斷。
+    若未來 AkShare 新增/恢復該欄位，程式碼無需修改即可自動納入。
     """
     import akshare as ak
     code = ticker.replace(".HK", "").zfill(5)
@@ -205,16 +210,43 @@ def fetch_southbound_holding(ticker: str) -> pd.DataFrame | None:
         return None
     if df is None or len(df) == 0:
         return None
-    df = df.rename(columns={
+
+    # 候選欄位對照表：中文欄名 → 內部使用名稱
+    # 只重新命名真正存在的欄位，不假設一定都在
+    rename_map = {
         "持股日期": "date",
         "持股数量": "hold_shares",
         "持股市值": "hold_value",
-    })
+        "持股数量占流通股比": "southbound_hold_pct",  # 若未來恢復/存在則自動納入
+    }
+    existing_rename = {k: v for k, v in rename_map.items() if k in df.columns}
+    df = df.rename(columns=existing_rename)
+
+    if "date" not in df.columns:
+        print(f"  ⚠️  {ticker} 南向資金數據缺少日期欄位，跳過")
+        return None
+
     df["date"] = pd.to_datetime(df["date"])
     df = df.sort_values("date").reset_index(drop=True)
-    df["southbound_hold_chg_1d"] = df["hold_shares"].diff()
-    df["southbound_hold_chg_5d"] = df["hold_shares"].diff(5)
-    return df[["date", "southbound_hold_chg_1d", "southbound_hold_chg_5d"]]
+
+    # 動態建立衍生欄位：只在 hold_shares 存在時才能算增減量
+    result_cols = ["date"]
+    if "hold_shares" in df.columns:
+        df["southbound_hold_chg_1d"] = df["hold_shares"].diff()
+        df["southbound_hold_chg_5d"] = df["hold_shares"].diff(5)
+        result_cols += ["southbound_hold_chg_1d", "southbound_hold_chg_5d"]
+
+    # 若佔比欄位剛好存在（目前版本沒有，但保留彈性），一併納入
+    if "southbound_hold_pct" in df.columns:
+        result_cols.append("southbound_hold_pct")
+
+    if len(result_cols) == 1:
+        # 只有 date，沒有任何可用的資金流欄位
+        print(f"  ⚠️  {ticker} 南向資金數據無可用欄位，跳過")
+        return None
+
+    return df[result_cols]
+
 
 
 
@@ -399,6 +431,9 @@ def build_stock_features(
     # ── 資金流欄位：南向資金持股變化（若呼叫端已合併則保留，否則補 NaN）──
     # 呼叫端應先呼叫 fetch_southbound_holding() 並 merge 到 df 再傳入本函式，
     # 本函式僅做欄位存在性保護，不主動下載（避免重複網路請求）。
+    # build_stock_features() 末段 —— 邏輯不變，動態補NaN本來就已支援「部分欄位缺失」
+    # 這段原本就是逐一檢查是否存在才補NaN，不需要額外修改，
+    # 已經能正確處理 fetch_southbound_holding() 回傳欄位數量不固定的情況
     for c in _FLOW_COLS:
         if c not in df.columns:
             df[c] = np.nan
