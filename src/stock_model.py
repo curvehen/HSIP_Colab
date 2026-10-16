@@ -495,15 +495,21 @@ def _train_lgbm_seeded(X_tr, y_tr, X_val, y_val, seed: int):
             callbacks = [lgb.early_stopping(40, verbose=False),
                          lgb.log_evaluation(period=-1)]
         )
+        # [修正過擬合] 與 models.py 的 train_lgbm()/train_model_fixed()
+        # 保持一致：改用sigmoid（Platt scaling）取代isotonic。個股模型
+        # 的驗證樣本量通常比恆指模型更小（單股歷史較短），isotonic在
+        # 小樣本下更容易產生階梯狀極端機率（0.99+/0.01-），sigmoid為
+        # 參數化平滑函數，更穩健。
         if _HAS_FROZEN_ESTIMATOR:
-            cal = CalibratedClassifierCV(FrozenEstimator(model), method="isotonic")
+            cal = CalibratedClassifierCV(FrozenEstimator(model), method="sigmoid")
         else:
-            cal = CalibratedClassifierCV(model, method="isotonic", cv="prefit")
+            cal = CalibratedClassifierCV(model, method="sigmoid", cv="prefit")
         cal.fit(X_val, y_val)
         return cal
     except Exception as e:
         print(f"    ⚠️  seed={seed} 訓練失敗: {e}")
         return None
+
 
 
 
