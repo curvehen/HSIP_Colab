@@ -216,7 +216,10 @@ AI_MODEL = "qwen-plus"
 FEATURE_BLACKLIST = {
     "date", "next_ret", "target",
     "open", "high", "low", "close", "volume",
+    "northbound_flow", "southbound_flow",
+    "nb_ma5", "nb_ma20", "nb_zscore", "nb_inflow", "nb_cum5",
 }
+
 
 
 # ============================================================
