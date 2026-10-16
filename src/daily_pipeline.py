@@ -159,12 +159,14 @@ def predict_next_day(state: dict) -> dict:
     last_row = df_all.iloc[[-1]].copy()
     regime   = hmm.predict_regime(last_row) if hasattr(hmm, "predict_regime") else "neutral"
 
-    X = align_features(last_row[feat_cols], feat_cols)
-    global_prob = safe_predict(global_m, X)[0]
+    # safe_predict() 需要 3 個參數 (model, df, feat_cols)，且回傳單一 float（非陣列），
+    # 不需要 [0] 索引。對齊 models.py 的真實簽名。
+    global_prob = safe_predict(global_m, last_row, feat_cols)
     regime_prob = (
-        safe_predict(regime_ms[regime], X)[0]
+        safe_predict(regime_ms[regime], last_row, feat_cols)
         if regime in regime_ms else global_prob
     )
+
 
     ensemble_prob = config.ensemble_weighter.blend(global_prob, regime_prob, regime)
     threshold = config.threshold_calibrator.get_threshold(regime)
