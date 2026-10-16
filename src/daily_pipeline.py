@@ -88,30 +88,45 @@ def save_pipeline_state(state: dict) -> None:
 # ============================================================
 def _apply_intraday_update(df_all: pd.DataFrame) -> pd.DataFrame:
     """
-    情境3（盤中執行）時，用即時報價更新 df_all 最後一行的 OHLC，
-    再對整個 df_all 重新計算技術指標，確保 RSI/MACD/布林通道等
-    與最新價格一致（方式A，已與使用者確認採用）。
+    情境3（盤中執行）時，用即時報價更新/新增 df_all 最新一行。
+
+    修正：原版直接覆寫 df_all.iloc[-1]，若該行日期不是「今天」
+    （例如因故延遲、或上游資料尚未收錄今日），會把今日盤中價格
+    誤標記成前一交易日的日期，污染歷史數據。改為先比對日期，
+    不符則新增一行，而非覆寫既有歷史行。
     """
     ctx = config.get_prediction_context()
     scenario = ctx["scenario"]
+    today = ctx["now_hkt"].date()
 
     if scenario != 3:
         return df_all
 
-    print("  📡 情境3（盤中）：取得即時報價並回填最後一行...")
+    print("  📡 情境3（盤中）：取得即時報價...")
     intraday = fetch_intraday_hsi(fallback_df=df_all)
     if intraday is None:
         print("  ⚠️  盤中報價全部來源失敗，沿用原始收盤數據")
         return df_all
 
-    last_row_updated = update_last_row_with_intraday(df_all.iloc[[-1]], intraday)
     df_all = df_all.copy()
-    df_all.iloc[-1] = last_row_updated.iloc[0]
+    last_date = pd.Timestamp(df_all.iloc[-1]["date"]).date()
+
+    if last_date == today:
+        last_row_updated = update_last_row_with_intraday(df_all.iloc[[-1]], intraday)
+        df_all.iloc[-1] = last_row_updated.iloc[0]
+        print(f"  🔄 更新既有的今日（{today}）行")
+    else:
+        new_row = df_all.iloc[[-1]].copy().reset_index(drop=True)
+        new_row.at[0, "date"] = pd.Timestamp(today)
+        new_row = update_last_row_with_intraday(new_row, intraday)
+        df_all = pd.concat([df_all, new_row], ignore_index=True)
+        print(f"  ➕ 新增今日（{today}）行（原最後一行為 {last_date}）")
 
     print("  🔄 重新計算全部技術指標（方式A：全量重跑 build_features）...")
     df_all = build_features(df_all)
 
     return df_all
+
 
 
 # ============================================================
