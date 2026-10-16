@@ -197,9 +197,10 @@ def fetch_southbound_holding(ticker: str) -> pd.DataFrame | None:
 
     [彈性設計] AkShare stock_hsgt_individual_em() 的實際回傳欄位
     可能因版本/接口調整而變動（已查證目前版本無「持股數量佔流通
-    股比」欄位）。本函式動態偵測哪些目標欄位真正存在，只處理存在
-    的欄位；缺失的欄位自動跳過，不會因此報錯或中斷。
-    若未來 AkShare 新增/恢復該欄位，程式碼無需修改即可自動納入。
+    股比」欄位，此前假設的欄位名稱不存在）。本函式動態偵測哪些
+    目標欄位真正存在，只處理存在的欄位；缺失的欄位自動跳過，
+    不會因此報錯或中斷。若未來 AkShare 新增/恢復該欄位，
+    程式碼無需修改即可自動納入。
     """
     import akshare as ak
     code = ticker.replace(".HK", "").zfill(5)
@@ -246,6 +247,7 @@ def fetch_southbound_holding(ticker: str) -> pd.DataFrame | None:
         return None
 
     return df[result_cols]
+
 
 
 
