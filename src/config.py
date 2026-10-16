@@ -471,13 +471,12 @@ def refresh_ctx() -> dict:
 # ENH #1: Regime-Based Dynamic Threshold Calibrator
 # ============================================================
 class RegimeThresholdCalibrator:
-    """
-    為每個 HMM regime 獨立 calibrate PROB_LONG / PROB_SHORT。
-    用 validation set F1 score 做優化目標。
-    """
-
-    def __init__(self, regimes=("bull", "neutral", "bear")):
+    def __init__(self, regimes=("bull", "neutral", "bear"),
+                 min_trades: int = 40,            # 新增:原硬編 20
+                 smoothing_alpha: float = 0.4):   # 新增:門檻平滑係數
         self.regimes = regimes
+        self.min_trades = min_trades
+        self.smoothing_alpha = smoothing_alpha
         self.thresholds = {
             r: {"long": PROB_LONG, "short": PROB_SHORT, "f1": 0.0, "n": 0}
             for r in regimes
@@ -490,32 +489,26 @@ class RegimeThresholdCalibrator:
             np.where(probs <= short_thresh, -1, 0),
         )
         mask = signals != 0
-        if mask.sum() < 10:
+        if mask.sum() < self.min_trades:          # 10 → self.min_trades(40)
             return 0.0
-        y_pred = (signals[mask] == 1).astype(int)
-        y_true = np.array(actuals)[mask]
-        if len(np.unique(y_true)) < 2:
-            return 0.0
-        return f1_score(y_true, y_pred, zero_division=0)
+        y_pred = signals[mask]
+        y_true = np.where(actuals[mask] > 0, 1, -1)
+        return f1_score(y_true, y_pred, average="macro", zero_division=0)
 
-    def calibrate(self, val_df: pd.DataFrame,
-                  prob_col: str = "ensemble_prob",
-                  target_col: str = "actual_target",
-                  regime_col: str = "regime"):
-        if len(val_df) < 30:
-            print("  [Calibrator] 樣本不足，使用 default threshold")
+    def calibrate(self, val_df, prob_col="ensemble_prob",
+                  target_col="actual_target", regime_col="regime"):
+        if len(val_df) < CALIBRATION_MIN_SAMPLES:  # 30 → 引用常數(50)
+            print("  [Calibrator] 樣本不足,使用 default threshold")
             return self
 
         for regime in self.regimes:
             rdf = val_df[val_df[regime_col] == regime]
-            if len(rdf) < 20:
+            if len(rdf) < self.min_trades:          # 20 → self.min_trades(40)
                 continue
 
             probs   = rdf[prob_col].values
             actuals = rdf[target_col].values
-            best_long  = PROB_LONG
-            best_short = PROB_SHORT
-            best_score = -1.0
+            best_long, best_short, best_score = PROB_LONG, PROB_SHORT, -1.0
 
             for lt in np.arange(0.52, 0.76, 0.02):
                 for st in np.arange(0.28, 0.49, 0.02):
@@ -523,22 +516,30 @@ class RegimeThresholdCalibrator:
                         continue
                     score = self._score_threshold(probs, actuals, lt, st)
                     if score > best_score:
-                        best_score = score
-                        best_long  = lt
-                        best_short = st
+                        best_score, best_long, best_short = score, lt, st
+
+            # --- 新增:門檻平滑,新舊加權平均,而非直接覆蓋 ---
+            prev = self.thresholds.get(regime)
+            if prev is not None and prev["n"] > 0:
+                a = self.smoothing_alpha
+                smoothed_long  = a * best_long  + (1 - a) * prev["long"]
+                smoothed_short = a * best_short + (1 - a) * prev["short"]
+            else:
+                smoothed_long, smoothed_short = best_long, best_short
 
             self.thresholds[regime] = {
-                "long":  round(best_long,  2),
-                "short": round(best_short, 2),
-                "f1":    round(best_score, 4),
-                "n":     len(rdf),
+                "long": round(smoothed_long, 2), "short": round(smoothed_short, 2),
+                "f1": round(best_score, 4), "n": len(rdf),
             }
-            print(f"  [Calibrator] {regime:8s}: "
-                  f"long={best_long:.2f} short={best_short:.2f} "
+            print(f"  [Calibrator] {regime:8s}: raw=({best_long:.2f}/{best_short:.2f}) "
+                  f"smoothed=({smoothed_long:.2f}/{smoothed_short:.2f}) "
                   f"F1={best_score:.4f} (n={len(rdf)})")
 
         self.fitted = True
         return self
+
+    # get_thresholds(), get_signal() 不變
+
 
     def get_thresholds(self, regime: str):
         if regime not in self.thresholds:
