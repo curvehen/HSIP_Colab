@@ -49,12 +49,12 @@ def run_initial_training(df_all: pd.DataFrame) -> dict:
     df_train = df_train.dropna(subset=["target"]).reset_index(drop=True)
     print(f"  訓練集行數 : {len(df_train)} rows ({TRAIN_START} → {TRAIN_END})")
 
-
-    sim_mask = df_all["date"] >= SIM_START
-    df_sim   = df_all[sim_mask].copy()
     # 模擬迴圈需要已知的 target 才能驗證對錯，排除最新尚無結果的一行
     # （features.py 已不再自動過濾，此處明確處理，避免模擬loop收到NaN）
-    df_sim   = df_sim.dropna(subset=["target"]).reset_index(drop=True)
+    sim_mask = df_all["date"] >= SIM_START
+    df_sim   = df_all[sim_mask].copy()
+    df_sim   = df_sim.dropna(subset=["target", "next_ret"]).reset_index(drop=True)
+
 
 
     print(f"  訓練集: {len(df_train)} 行 | "
