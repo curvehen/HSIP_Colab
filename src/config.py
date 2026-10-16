@@ -688,6 +688,7 @@ STATE_KEYS = [
     "monitor", "memory", "drift",
     "threshold_calibrator", "position_sizer", "ensemble_weighter",
     "wf_monthly", "last_backtest_report",
+    "last_roll_acc",   # predict_next_day() 計算倉位時使用，由 run_daily_simulation() 寫入
 ]
 
 CHART_STATE_KEYS = [
