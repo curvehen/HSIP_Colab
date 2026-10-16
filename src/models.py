@@ -405,13 +405,18 @@ def train_model_fixed(train_df: pd.DataFrame, feat_cols: list, val_pct: float = 
             callbacks = [lgb.early_stopping(40, verbose=False),
                          lgb.log_evaluation(period=-1)]
         )
-        cal = CalibratedClassifierCV(model, method="isotonic", cv="prefit")
+        # cv="prefit" 已在新版 scikit-learn（1.6+）移除，改用 FrozenEstimator
+        if _HAS_FROZEN_ESTIMATOR:
+            cal = CalibratedClassifierCV(FrozenEstimator(model), method="isotonic")
+        else:
+            cal = CalibratedClassifierCV(model, method="isotonic", cv="prefit")
         cal.fit(X_val, y_val)
         m = safe_eval(cal, X_val, y_val, feat_cols)
         return cal, m["auc"]
     except Exception as e:
         print(f"    ⚠️  訓練失敗: {str(e)[:50]}")
         return None, 0.0
+
 
 
 # ============================================================
