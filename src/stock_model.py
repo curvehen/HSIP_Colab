@@ -519,7 +519,7 @@ def train_stock_models(
                 print(f"  ❌ {ticker}: 全部 seed 訓練失敗")
                 continue
 
-            val_prob = _ensemble_predict_proba(seed_models, X_val)
+            val_prob = _ensemble_predict_proba(seed_models, X_val, feat_cols)
             auc = roc_auc_score(y_val, val_prob) if y_val.nunique() > 1 else float("nan")
             acc = accuracy_score(y_val, (val_prob > 0.5).astype(int))
 
@@ -632,7 +632,7 @@ def daily_stock_update(
                         last_row.at[0, "ret_1d"] = intra_dict["intraday_ret"]
 
         X = align_features(last_row[feat_cols], feat_cols)
-        prob = _ensemble_predict_proba(stock_models[ticker], X)[0]
+        prob = _ensemble_predict_proba(stock_models[ticker], last_row, feat_cols)[0]
 
         rows.append({
             "ticker": ticker,
