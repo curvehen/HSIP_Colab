@@ -72,7 +72,6 @@ STOCK_TOP_N       = cfg.STOCK_TOP_N
 _FLOW_COLS = [
     "southbound_hold_chg_1d",
     "southbound_hold_chg_5d",
-    "southbound_hold_pct",
 ]
 
 _EXCLUDE_COLS = {
@@ -188,35 +187,35 @@ def download_stock(
 # 1b. 南向資金持股數據（取代原 _FLOW_COLS 的主力/大單拆分，
 #     因 AkShare 無法穩定提供港股個股的主力資金流拆分）
 # ============================================================
+# 改動後
 def fetch_southbound_holding(ticker: str) -> pd.DataFrame | None:
     """
     取得單一港股的南向資金（港股通）每日持股變化。
-    ticker 格式如 "0700.HK" -> 轉換為 AkShare 要求的 "00700"
+    [修正] stock_hsgt_individual_em() 實際並無「持股數量佔流通股比」
+    欄位（已查證），原欄位名稱為臆測、不存在。改為只保留可直接取得
+    的持股量增減特徵，不計算佔比（避免額外呼叫流通股本接口增加
+    複雜度與失敗點）。
     """
     import akshare as ak
-
     code = ticker.replace(".HK", "").zfill(5)
     try:
         df = ak.stock_hsgt_individual_em(symbol=code)
     except Exception as e:
         print(f"  ⚠️  {ticker} 南向資金數據取得失敗: {e}")
         return None
-
     if df is None or len(df) == 0:
         return None
-
     df = df.rename(columns={
         "持股日期": "date",
         "持股数量": "hold_shares",
         "持股市值": "hold_value",
-        "持股数量占流通股比": "southbound_hold_pct",
     })
     df["date"] = pd.to_datetime(df["date"])
     df = df.sort_values("date").reset_index(drop=True)
     df["southbound_hold_chg_1d"] = df["hold_shares"].diff()
     df["southbound_hold_chg_5d"] = df["hold_shares"].diff(5)
+    return df[["date", "southbound_hold_chg_1d", "southbound_hold_chg_5d"]]
 
-    return df[["date", "southbound_hold_chg_1d", "southbound_hold_chg_5d", "southbound_hold_pct"]]
 
 
 # ============================================================
