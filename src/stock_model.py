@@ -462,22 +462,50 @@ def get_stock_feat_cols(df: pd.DataFrame) -> list[str]:
             cols.append(c)
     return cols
 
+def _safe_predict_batch(model, X: pd.DataFrame, feat_cols: list) -> np.ndarray:
+    """
+    批次版本的安全預測，用於驗證集評估（整批多行），
+    與 models.safe_predict()（僅處理單行、回傳單一float）區分用途。
+    """
+    try:
+        X_aligned = align_features(X, feat_cols)
+        if hasattr(model, "n_features_in_"):
+            expected = model.n_features_in_
+            actual   = X_aligned.shape[1]
+            if expected != actual:
+                if actual > expected:
+                    X_aligned = X_aligned.iloc[:, :expected]
+                else:
+                    for i in range(expected - actual):
+                        X_aligned[f"_pad_{i}"] = 0.0
+        prob = model.predict_proba(X_aligned)[:, 1]
+        return np.clip(prob, 0.02, 0.98)
+    except Exception as e:
+        print(f"    ⚠️  批次預測失敗: {str(e)[:80]}")
+        return np.full(len(X), 0.5)
 
 # ============================================================
 # 5. 多種子集成預測（輔助函式）
 # ============================================================
 def _ensemble_predict_proba(models: list, X: pd.DataFrame, feat_cols: list) -> np.ndarray:
-    """對同一檔股票的多個 seed 模型取平均機率。"""
+    """
+    對同一檔股票的多個 seed 模型取平均機率。
+    支援批次輸入（X可為多行），回傳與X行數相同長度的機率陣列。
+    [修正] 原本誤用 models.safe_predict()（僅支援單行、回傳單一
+    float），導致驗證集（如222行）被硬壓成1個數字，與y_val的222筆
+    長度不符，引發 roc_auc_score 的 ValueError。改用本模組自建的
+    _safe_predict_batch()，正確保留批次維度。
+    """
     if not models:
-        return np.full(1, 0.5)
+        return np.full(len(X), 0.5)
     probs = []
     for m in models:
-        p = safe_predict(m, X, feat_cols)
-        if p is not None:
-            probs.append(p)
+        p = _safe_predict_batch(m, X, feat_cols)
+        probs.append(p)
     if not probs:
-        return np.full(1, 0.5)
-    return np.array([np.mean(probs)])
+        return np.full(len(X), 0.5)
+    return np.mean(probs, axis=0)
+
 
 
 
