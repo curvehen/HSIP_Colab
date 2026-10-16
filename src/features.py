@@ -120,7 +120,11 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     df["dow_sin"]        = np.sin(2 * np.pi * df["dow"] / 5)
     df["dow_cos"]        = np.cos(2 * np.pi * df["dow"] / 5)
 
-    df = df.dropna(subset=["target","next_ret","rsi_14","macd","bb_pos"])
+    # 僅過濾技術指標暖機期的 NaN（開頭 ~26 行），
+    # 不過濾 target/next_ret —— 這兩者對「最新一行」(尚無明日數據)
+    # 必然是 NaN，但該行正是預測所需的最新資料，不應在此被丟棄。
+    # target 為 NaN 的過濾責任交給 training.py 的訓練/模擬流程自行處理。
+    df = df.dropna(subset=["rsi_14","macd","bb_pos"])
     df = df.reset_index(drop=True)
     return df
 
