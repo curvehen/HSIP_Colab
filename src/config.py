@@ -698,5 +698,5 @@ CHART_STATE_KEYS = [
     "last_backtest_report",
 ]
 
-CALIBRATION_MIN_SAMPLES = 30
+CALIBRATION_MIN_SAMPLES = 50
 
