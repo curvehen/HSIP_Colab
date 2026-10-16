@@ -18,6 +18,12 @@ from src.config import (
     KS_PVALUE, ROLLBACK_TOLERANCE
 )
 
+from sklearn.calibration import CalibratedClassifierCV
+try:
+    from sklearn.frozen import FrozenEstimator
+    _HAS_FROZEN_ESTIMATOR = True
+except ImportError:
+    _HAS_FROZEN_ESTIMATOR = False
 
 # ============================================================
 # ENH #6: Enhanced HMMRegime (6維輸入特徵)
@@ -156,9 +162,16 @@ def train_lgbm(X_tr, y_tr, X_val, y_val):
         callbacks = [lgb.early_stopping(40, verbose=False),
                      lgb.log_evaluation(period=-1)]
     )
-    cal = CalibratedClassifierCV(model, method="isotonic", cv="prefit")
+    # cv="prefit" 已在新版 scikit-learn（1.6+）移除，改用 FrozenEstimator
+    # 包裝已訓練模型，效果與原本的 "prefit" 模式等價（不重新訓練，只做校準）。
+    if _HAS_FROZEN_ESTIMATOR:
+        cal = CalibratedClassifierCV(FrozenEstimator(model), method="isotonic")
+    else:
+        # 相容舊版 scikit-learn（<1.6）環境的備援寫法
+        cal = CalibratedClassifierCV(model, method="isotonic", cv="prefit")
     cal.fit(X_val, y_val)
     return cal
+
 
 
 def eval_model(model, X, y):
