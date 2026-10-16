@@ -46,6 +46,12 @@ from src.models import align_features, safe_predict
 #       原因：train_lgbm() 不支援自訂 random_state，為避免修改共用
 #       檔案 models.py（會影響 training.py / hl_model.py 的既有呼叫
 #       路徑），在本檔案內複製一份邏輯並擴充 seed 參數。
+from sklearn.calibration import CalibratedClassifierCV
+try:
+    from sklearn.frozen import FrozenEstimator
+    _HAS_FROZEN_ESTIMATOR = True
+except ImportError:
+    _HAS_FROZEN_ESTIMATOR = False
 
 
 # ============================================================
@@ -443,10 +449,6 @@ def _ensemble_predict_proba(models: list, X: pd.DataFrame) -> np.ndarray:
 #     不修改共用檔案，僅本模組使用 — 方案B）
 # ============================================================
 def _train_lgbm_seeded(X_tr, y_tr, X_val, y_val, seed: int):
-    """
-    與 models.train_lgbm() 邏輯一致，額外支援自訂 random_state/bagging_seed，
-    用於個股多 seed 集成訓練。
-    """
     try:
         params = {**cfg.LGBM_PARAMS, "random_state": seed, "bagging_seed": seed}
         model = lgb.LGBMClassifier(**params)
@@ -456,12 +458,16 @@ def _train_lgbm_seeded(X_tr, y_tr, X_val, y_val, seed: int):
             callbacks = [lgb.early_stopping(40, verbose=False),
                          lgb.log_evaluation(period=-1)]
         )
-        cal = CalibratedClassifierCV(model, method="isotonic", cv="prefit")
+        if _HAS_FROZEN_ESTIMATOR:
+            cal = CalibratedClassifierCV(FrozenEstimator(model), method="isotonic")
+        else:
+            cal = CalibratedClassifierCV(model, method="isotonic", cv="prefit")
         cal.fit(X_val, y_val)
         return cal
     except Exception as e:
         print(f"    ⚠️  seed={seed} 訓練失敗: {e}")
         return None
+
 
 
 # ============================================================
