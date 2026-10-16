@@ -358,8 +358,13 @@ def safe_predict(model, X: pd.DataFrame, feat_cols: list) -> float:
                     for i in range(expected - actual):
                         X_aligned[f"_pad_{i}"] = 0.0
 
+        # [修正過擬合] 原本 clip(0.0, 1.0) 範圍等同未裁切（機率本就落在
+        # 此區間），無法攔截isotonic/校準器在小樣本下產生的極端值
+        # （如0.99+/0.01-）。收緊為 (0.02, 0.98)，確保 position_sizer
+        # 的 Kelly 公式不會因單一過度自信的預測而建議不合理倉位。
         prob = model.predict_proba(X_aligned)[:, 1]
-        return float(np.clip(prob[0], 0.0, 1.0))
+        return float(np.clip(prob[0], 0.02, 0.98))
+
 
     except Exception as e:
         print(f"  ⚠️  safe_predict 失敗: {str(e)[:80]}")
@@ -408,10 +413,12 @@ def train_model_fixed(train_df: pd.DataFrame, feat_cols: list, val_pct: float = 
                          lgb.log_evaluation(period=-1)]
         )
         # cv="prefit" 已在新版 scikit-learn（1.6+）移除，改用 FrozenEstimator
+        # [修正過擬合] 同train_lgbm()，改用sigmoid避免小樣本下的極端機率
         if _HAS_FROZEN_ESTIMATOR:
-            cal = CalibratedClassifierCV(FrozenEstimator(model), method="isotonic")
+            cal = CalibratedClassifierCV(FrozenEstimator(model), method="sigmoid")
         else:
-            cal = CalibratedClassifierCV(model, method="isotonic", cv="prefit")
+            cal = CalibratedClassifierCV(model, method="sigmoid", cv="prefit")
+
         cal.fit(X_val, y_val)
         m = safe_eval(cal, X_val, y_val, feat_cols)
         return cal, m["auc"]
