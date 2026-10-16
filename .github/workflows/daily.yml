@@ -5,6 +5,9 @@ on:
     - cron: '45 8 * * 1-5'   # 16:45 HKT, Mon-Fri (UTC 08:45)
   workflow_dispatch:         # allow manual trigger
 
+permissions:
+  contents: write   # 允許 workflow 使用 GITHUB_TOKEN 寫入/push repo 內容
+
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
